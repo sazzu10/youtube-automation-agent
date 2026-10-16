@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const fs = require('fs').promises;
 const path = require('path');
 const axios = require('axios');
+const { MagicHourProvider } = require('./magic-hour-provider');
 const Replicate = require('replicate');
 
 const DEFAULT_PROVIDER_ORDER = ['seedance', 'minimax_h3', 'google_omni', 'kling', 'wan', 'slideshow'];
@@ -409,6 +410,127 @@ class WanProvider extends VideoProvider {
   }
 }
 
+const PixabayProvider = require('./pixabay-provider')(VideoProvider, normalizeCredentials);
+
+
+class AgnesProvider extends VideoProvider {
+  constructor(credentials, options = {}) {
+    const creds = normalizeCredentials(credentials);
+    super('agnes', {
+      model: options.model || process.env.AGNES_VIDEO_MODEL || 'agnes-video-2.5-flash',
+      capabilities: {
+        minDuration: 4, maxDuration: 12, defaultResolution: '720P',
+        maxPromptLength: 7000, text: true, firstFrame: true,
+        lastFrame: true, referenceImages: 5, referenceVideos: 0,
+        referenceAudios: 3, nativeAudio: false
+      }
+    });
+
+    this.apiKey = options.apiKey || creds.agnes?.apiKey || process.env.AGNES_API_KEY;
+    this.baseUrl = (options.baseUrl || process.env.AGNES_API_BASE || 'https://apihub.agnes-ai.com').replace(/\/$/, '');
+    this.http = options.http || axios;
+  }
+
+  isAvailable() {
+    return Boolean(this.apiKey);
+  }
+
+  headers() {
+    return {
+      Authorization: `Bearer ${this.apiKey}`,
+      'Content-Type': 'application/json'
+    };
+  }
+
+  async createTask(input) {
+    const request = this.normalizeRequest(input);
+
+    const body = {
+      model: this.model,
+      prompt: request.prompt,
+      mode: request.firstFrame || request.lastFrame ? 'keyframe' : 'text',
+      seconds: String(Math.round(request.duration)),
+      size: '720P',
+      aspect_ratio: request.aspectRatio || '9:16',
+      n: 1
+    };
+
+    if (request.firstFrame) {
+      body.first_frame = await fileToDataUrl(request.firstFrame);
+    }
+
+    if (request.lastFrame) {
+      body.last_frame = await fileToDataUrl(request.lastFrame);
+    }
+
+    const response = await this.http.post(
+      `${this.baseUrl}/v1/videos`,
+      body,
+      { headers: this.headers(), timeout: 120000 }
+    );
+
+    const data = response.data || {};
+    const videoId = data.video_id || data.id;
+
+    if (!videoId) {
+      throw new Error(`Agnes did not return video_id: ${JSON.stringify(data).slice(0, 500)}`);
+    }
+
+    return {
+      externalTaskId: videoId,
+      status: 'queued',
+      outputUrl: null,
+      error: null,
+      model: this.model
+    };
+  }
+
+  async getTask(id) {
+    const response = await this.http.get(
+      `${this.baseUrl}/agnesapi`,
+      {
+        params: {
+          video_id: id,
+          model_name: this.model
+        },
+        headers: this.headers(),
+        timeout: 30000
+      }
+    );
+
+    const data = response.data || {};
+    const status = String(data.status || '').toLowerCase();
+
+    if (status === 'completed' || status === 'succeeded' || status === 'success' || status === 'done') {
+      return {
+        externalTaskId: id,
+        status: 'succeeded',
+        outputUrl: data.url || data.metadata?.url || data.video_url || null,
+        error: null,
+        model: this.model
+      };
+    }
+
+    if (status === 'failed' || status === 'error' || status === 'cancelled') {
+      return {
+        externalTaskId: id,
+        status: status === 'cancelled' ? 'cancelled' : 'failed',
+        outputUrl: null,
+        error: safeModelError(data.error || data.message || `Agnes video generation ${status}`),
+        model: this.model
+      };
+    }
+
+    return {
+      externalTaskId: id,
+      status: 'running',
+      outputUrl: null,
+      error: null,
+      model: this.model
+    };
+  }
+}
+
 class SlideshowProvider extends VideoProvider {
   constructor() {
     super('slideshow', { model: 'local-ffmpeg', capabilities: { local: true, text: true, maxDuration: Infinity } });
@@ -425,6 +547,9 @@ class VideoProviderRegistry {
       ['google_omni', injected.google_omni || new GoogleOmniProvider(credentials, options.google_omni)],
       ['kling', injected.kling || new KlingProvider(credentials, options.kling)],
       ['wan', injected.wan || new WanProvider(credentials, options.wan)],
+      ['agnes', injected.agnes || new AgnesProvider(credentials, options.agnes)],
+      ['magic_hour', injected.magic_hour || new MagicHourProvider(credentials, options.magic_hour)],
+      ['pixabay', injected.pixabay || new PixabayProvider(credentials, options.pixabay)],
       ['slideshow', injected.slideshow || new SlideshowProvider()]
     ]);
   }
@@ -452,8 +577,11 @@ module.exports = {
   SeedanceProvider,
   MiniMaxH3Provider,
   GoogleOmniProvider,
+  PixabayProvider,
   KlingProvider,
   WanProvider,
+  AgnesProvider,
+  MagicHourProvider,
   SlideshowProvider,
   safeModelError
 };

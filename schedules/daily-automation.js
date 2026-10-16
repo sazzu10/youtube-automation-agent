@@ -1,4 +1,6 @@
 const cron = require('node-cron');
+const { InboxScanner } = require('../integrations/content/inbox-scanner');
+const instagramQueue = require('../integrations/instagram/queue');
 const { Logger } = require('../utils/logger');
 
 class DailyAutomation {
@@ -13,7 +15,51 @@ class DailyAutomation {
     this.generateContent = options.generateContent || null;
     this.engagement = options.engagement || null;
     this.experiments = options.experiments || null;
+    this.instagramWorker = options.instagramWorker || null;
+    this.inboxScanner = options.inboxScanner || null;
+    this.publicMediaServer = options.publicMediaServer || null;
+    this.inboxProductionBridge = options.inboxProductionBridge || null;
+    this.instagramQueue = instagramQueue;
+    this.isProcessingInbox = false;
+    if (this.inboxScanner) {
+      this.scheduledTasks.set('content-inbox-scan', cron.schedule('* * * * *', async () => {
+        if (this.isEnabled) {
+          await this.processContentInbox();
+        }
+      }, { scheduled: false }));
+    }
   }
+
+
+  async processContentInbox() {
+    if (this.isProcessingInbox) {
+      this.logger.info('Content Inbox scan already running; skipping overlapping run');
+      return 0;
+    }
+    this.isProcessingInbox = true;
+    try {
+      if (!this.inboxProductionBridge) return 0;
+
+      const result = await this.inboxProductionBridge.run();
+
+      if (result.processed > 0) {
+        this.logger.info(
+          `Content Inbox: processed=${result.processed}, ` +
+          `scheduled=${result.scheduled}, failed=${result.failed}`
+        );
+      }
+
+      return result.scheduled;
+    } catch (error) {
+      this.logger.error(
+        `Content Inbox processing failed: ${error.message}`
+      );
+      return 0;
+    } finally {
+      this.isProcessingInbox = false;
+    }
+  }
+
 
   async initialize() {
     this.logger.info('Initializing daily automation scheduler...');
@@ -28,13 +74,15 @@ class DailyAutomation {
   }
 
   async setupScheduledTasks() {
-    // Daily content generation at 6:00 AM
+    const tz = process.env.CHANNEL_TIMEZONE || process.env.YOUTUBE_TIMEZONE || 'America/Los_Angeles';
+
+    // Daily content generation at 6:00 AM (in US audience timezone)
     this.scheduledTasks.set('daily-content-generation', 
       cron.schedule('0 6 * * *', async () => {
-        if (this.isEnabled) {
+        if (this.isEnabled && process.env.DAILY_CONTENT_GENERATION === 'on') {
           await this.runDailyContentGeneration();
         }
-      }, { scheduled: false })
+      }, { scheduled: false, timezone: tz })
     );
 
     // Publishing queue processing every 15 minutes
@@ -45,6 +93,17 @@ class DailyAutomation {
         }
       }, { scheduled: false })
     );
+
+    // Instagram publishing queue processing every 15 minutes
+    if (this.instagramWorker) {
+      this.scheduledTasks.set('instagram-publish-queue-processing',
+        cron.schedule('*/15 * * * *', async () => {
+          if (this.isEnabled) {
+            await this.processInstagramPublishQueue();
+          }
+        }, { scheduled: false })
+      );
+    }
 
     // Analytics collection at 9:00 AM daily
     this.scheduledTasks.set('daily-analytics',
@@ -255,6 +314,35 @@ class DailyAutomation {
         error: error.message
       });
       await this.sendFailureNotification('Publishing Queue', error);
+    }
+  }
+
+  async processInstagramPublishQueue() {
+    try {
+      if (!this.instagramWorker) {
+        return 0;
+      }
+
+      const published = await this.instagramWorker.processDuePosts();
+
+      if (published > 0) {
+        this.logger.info(`Published ${published} Instagram posts from queue`);
+
+        await this.logAutomationEvent('instagram_queue_processing', 'success', {
+          publishedCount: published
+        });
+      }
+
+      return published;
+    } catch (error) {
+      this.logger.error('Failed to process Instagram publish queue:', error);
+
+      await this.logAutomationEvent('instagram_queue_processing', 'error', {
+        error: error.message
+      });
+
+      await this.sendFailureNotification('Instagram Publishing Queue', error);
+      return 0;
     }
   }
 

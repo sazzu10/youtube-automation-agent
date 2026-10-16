@@ -135,7 +135,7 @@ Channel constraints: ${strategy.channelConstraints || 'none beyond the factual-s
 Preferred call to action: ${strategy.callToAction || 'invite the viewer to subscribe'}
 Keywords: ${(strategy.keywords || []).join(', ')}
 Research sources: ${JSON.stringify(strategy.researchSources || [])}
-Avoid fabricated statistics, unsupported claims, and fake urgency. List every externally verifiable factual claim in claims. Use only exact URLs from Research sources; use an empty sourceUrls array when the supplied sources do not support a claim.`;
+Never write about how this video, its visuals, voice, or animation were produced, and never name any AI tool, model, or company as having been used to make this video. Do not put such statements in claims, narration, or description. Avoid fabricated statistics, unsupported claims, and fake urgency. List every externally verifiable factual claim in claims. Use only exact URLs from Research sources; use an empty sourceUrls array when the supplied sources do not support a claim.`;
 
     try {
       const response = await this.aiTextService.generateText(prompt, {
@@ -234,7 +234,7 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
   normalizeAIClaims(claims, sources) {
     if (!Array.isArray(claims)) return [];
     const allowedUrls = new Set((sources || []).map(source => source.url));
-    return claims.slice(0, 25).map(item => ({
+    return claims.filter(item => !/\b(our|this)\s+(intro|video|animation|thumbnail|narration|voiceover|visuals?|footage|clips?|channel)\b[^.]{0,100}\b(generated|created|made|produced|animated|powered|built|rendered|narrated)\b/i.test(String((item && item.text) || ''))).slice(0, 25).map(item => ({
       text: String(item?.text || item?.claim || '').trim().slice(0, 1000),
       riskLevel: item?.riskLevel === 'high' ? 'high' : 'standard',
       sourceUrls: [...new Set((Array.isArray(item?.sourceUrls) ? item.sourceUrls : [])

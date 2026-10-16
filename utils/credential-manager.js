@@ -33,6 +33,21 @@ class CredentialManager {
     } catch (error) {
       this.credentials = {};
     }
+
+    if (!this.credentials.youtube) {
+      if (process.env.YOUTUBE_CREDENTIALS_JSON) {
+        try {
+          const parsed = JSON.parse(process.env.YOUTUBE_CREDENTIALS_JSON);
+          this.credentials.youtube = parsed.installed || parsed.web || parsed.youtube || parsed;
+        } catch (_) {}
+      } else if (process.env.YOUTUBE_CLIENT_ID && process.env.YOUTUBE_CLIENT_SECRET) {
+        this.credentials.youtube = {
+          client_id: process.env.YOUTUBE_CLIENT_ID,
+          client_secret: process.env.YOUTUBE_CLIENT_SECRET,
+          redirect_uris: [process.env.YOUTUBE_REDIRECT_URI || 'http://localhost:8080/oauth2callback']
+        };
+      }
+    }
   }
 
   async loadTokens() {
@@ -41,6 +56,21 @@ class CredentialManager {
       this.tokens = JSON.parse(data);
     } catch (error) {
       this.tokens = {};
+    }
+
+    if (!this.tokens.youtube) {
+      if (process.env.YOUTUBE_TOKENS_JSON) {
+        try {
+          const parsed = JSON.parse(process.env.YOUTUBE_TOKENS_JSON);
+          this.tokens.youtube = parsed.youtube || parsed;
+        } catch (_) {}
+      } else if (process.env.YOUTUBE_REFRESH_TOKEN) {
+        this.tokens.youtube = {
+          refresh_token: process.env.YOUTUBE_REFRESH_TOKEN,
+          scope: process.env.YOUTUBE_SCOPE || 'https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube',
+          token_type: 'Bearer'
+        };
+      }
     }
   }
 

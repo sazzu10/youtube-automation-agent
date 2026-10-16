@@ -22,6 +22,10 @@ class Database {
       
       // Create tables
       await this.createTables();
+
+      // Startup recovery: any row still 'uploading' from a previous crashed
+      // process has an unknown YouTube outcome — move it to reconciliation_required.
+      await this.markInterruptedJobs();
       
       this.logger.success('Database initialized successfully');
       return true;
@@ -622,6 +626,47 @@ class Database {
         value TEXT NOT NULL,
         description TEXT,
         updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      )`,
+
+      // Instagram Publish Queue
+      `CREATE TABLE IF NOT EXISTS instagram_publish_queue (
+        id TEXT PRIMARY KEY,
+        production_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        publish_time TEXT NOT NULL,
+        status TEXT DEFAULT 'scheduled',
+        priority INTEGER DEFAULT 50,
+        video_url TEXT,
+        caption TEXT,
+        container_id TEXT,
+        instagram_media_id TEXT,
+        published_at TEXT,
+        error_message TEXT,
+        retry_count INTEGER DEFAULT 0,
+        original_media_id TEXT,
+        original_published_record_id TEXT,
+        optimization_version INTEGER DEFAULT 1,
+        content_hash TEXT,
+        idempotency_key TEXT,
+        locked_at TEXT,
+        locked_by TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (production_id) REFERENCES productions(id)
+      )`,
+
+      // Cross-Platform Published Media Registry (ensures same video never uploads twice to same platform)
+      `CREATE TABLE IF NOT EXISTS published_media_registry (
+        id TEXT PRIMARY KEY,
+        content_hash TEXT NOT NULL,
+        platform TEXT NOT NULL,
+        production_id TEXT,
+        platform_post_id TEXT,
+        platform_url TEXT,
+        status TEXT NOT NULL DEFAULT 'published',
+        published_at TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(content_hash, platform)
       )`
     ];
 
@@ -647,13 +692,47 @@ class Database {
     await this.ensureColumns('discoverability_audits', {
       error_code: 'TEXT'
     });
+    await this.ensureColumns('productions', {
+      content_hash: 'TEXT',
+      metadata_status: "TEXT DEFAULT 'ready'",
+      seo_data_json: 'TEXT'
+    });
+    await this.ensureColumns('publish_schedule', {
+      content_hash: 'TEXT',
+      idempotency_key: 'TEXT',
+      locked_at: 'TEXT',
+      locked_by: 'TEXT',
+      attempt_count: 'INTEGER DEFAULT 0'
+    });
+    await this.ensureColumns('instagram_publish_queue', {
+      content_hash: 'TEXT',
+      idempotency_key: 'TEXT',
+      locked_at: 'TEXT',
+      locked_by: 'TEXT',
+      original_media_id: 'TEXT',
+      original_published_record_id: 'TEXT',
+      optimization_version: 'INTEGER DEFAULT 1'
+    });
+
+    // Indexes for fast duplicate checks
+    await this.executeQuery('CREATE INDEX IF NOT EXISTS idx_pub_reg_hash ON published_media_registry(content_hash, platform)').catch(() => {});
+    await this.executeQuery('CREATE INDEX IF NOT EXISTS idx_pub_sched_hash ON publish_schedule(content_hash)').catch(() => {});
+    await this.executeQuery('CREATE INDEX IF NOT EXISTS idx_ig_queue_hash ON instagram_publish_queue(content_hash)').catch(() => {});
 
     // Insert default settings
     await this.insertDefaultSettings();
   }
 
   async ensureColumns(tableName, columns) {
-    const allowedTables = new Set(['production_scenes', 'channel_strategies', 'discoverability_audits']);
+    const allowedTables = new Set([
+      'production_scenes',
+      'channel_strategies',
+      'discoverability_audits',
+      'productions',
+      'publish_schedule',
+      'instagram_publish_queue',
+      'published_media_registry'
+    ]);
     if (!allowedTables.has(tableName)) throw new Error(`Unsupported migration table: ${tableName}`);
     const existing = new Set((await this.getAllRows(`PRAGMA table_info(${tableName})`)).map(column => column.name));
     for (const [columnName, definition] of Object.entries(columns)) {
@@ -673,10 +752,12 @@ class Database {
       ['thumbnail_ab_testing', 'false', 'Enable thumbnail A/B testing'],
       ['content_backup_enabled', 'true', 'Enable content backup'],
       ['notification_enabled', 'true', 'Enable system notifications'],
-      ['approval_required', 'true', 'Require human approval before scheduling generated content'],
+      ['approval_required', 'false', 'Require human approval before scheduling generated content (defaults to false for automated publishing)'],
       ['automation_paused', 'false', 'Pause generation and publishing automation'],
-      ['channel_timezone', 'America/Chicago', 'Timezone used to present channel schedules'],
-      ['max_daily_posts', '1', 'Maximum posts per day'],
+      ['channel_timezone', 'Asia/Kolkata', 'Timezone used to present channel schedules'],
+      ['instagram_daily_target', '10', 'Target Instagram reels to publish per day'],
+      ['youtube_daily_target', '6', 'Target YouTube videos to publish per day'],
+      ['max_daily_posts', '6', 'Maximum posts per day'],
       ['content_buffer_days', '3', 'Days of content to keep in buffer'],
       ['video_provider', 'slideshow', 'Video provider: slideshow, auto, seedance, minimax_h3, google_omni, kling, or wan'],
       ['video_provider_order', 'seedance,minimax_h3,google_omni,kling,wan,slideshow', 'Provider priority used by automatic routing'],
@@ -1377,6 +1458,27 @@ class Database {
        error = 'The application restarted before this operator run finished', updated_at = datetime('now'),
        completed_at = datetime('now') WHERE status IN ('queued', 'running', 'cancelling')`
     );
+    const cutoff = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+    const res = await this.executeQuery(
+      `UPDATE publish_schedule
+       SET status      = 'reconciliation_required',
+           locked_at   = NULL,
+           locked_by   = NULL,
+           error_message = COALESCE(
+             error_message,
+             'Upload interrupted at startup; outcome unknown — reconcile before retrying'
+           )
+       WHERE status = 'uploading'
+         AND (locked_at IS NULL OR locked_at < ?)`,
+      [cutoff]
+    );
+    const count = res?.changes ?? 0;
+    if (count > 0) {
+      this.logger.warn(
+        `markInterruptedJobs: moved ${count} stale 'uploading' row(s) to 'reconciliation_required'`
+      );
+    }
+    return count;
   }
 
   async saveContentReview(productionId, review = {}) {
@@ -1859,6 +1961,86 @@ class Database {
     
     return rows.map(row => this.deserializeScheduleEntry(row));
   }
+
+  // Idempotent Published Media Registry
+  async savePublishedMediaRegistry({ contentHash, platform, productionId = null, platformPostId = null, platformUrl = null, publishedAt = null }) {
+    if (!contentHash || !platform) return null;
+    const id = `reg_${platform}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const pubTime = publishedAt || new Date().toISOString();
+    await this.executeQuery(
+      `INSERT INTO published_media_registry (
+        id, content_hash, platform, production_id, platform_post_id, platform_url, status, published_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 'published', ?)
+      ON CONFLICT(content_hash, platform) DO UPDATE SET
+        production_id = COALESCE(excluded.production_id, published_media_registry.production_id),
+        platform_post_id = COALESCE(excluded.platform_post_id, published_media_registry.platform_post_id),
+        platform_url = COALESCE(excluded.platform_url, published_media_registry.platform_url),
+        status = 'published',
+        published_at = COALESCE(published_media_registry.published_at, excluded.published_at)`,
+      [id, contentHash, platform, productionId, platformPostId, platformUrl, pubTime]
+    );
+    return id;
+  }
+
+  async getPublishedRecord(contentHash, platform) {
+    if (!contentHash || !platform) return null;
+    return this.getRow(
+      `SELECT * FROM published_media_registry
+       WHERE content_hash = ? AND platform = ? AND status = 'published'
+       LIMIT 1`,
+      [contentHash, platform]
+    );
+  }
+
+  async getPublishedMediaHistory(limit = 50) {
+    return this.getAllRows(
+      `SELECT * FROM published_media_registry
+       ORDER BY published_at DESC LIMIT ?`,
+      [limit]
+    );
+  }
+
+  async claimPublishScheduleItem(id, workerId = 'worker') {
+    const cutoff = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+    const res = await this.executeQuery(
+      `UPDATE publish_schedule
+       SET status = 'uploading',
+           locked_at = datetime('now'),
+           locked_by = ?
+       WHERE id = ?
+         AND (status = 'scheduled' OR (status = 'uploading' AND (locked_at IS NULL OR locked_at < ?)))`,
+      [workerId, id, cutoff]
+    );
+    return res?.changes > 0;
+  }
+
+  async releasePublishScheduleItem(id, status = 'scheduled', errorMessage = null) {
+    await this.executeQuery(
+      `UPDATE publish_schedule
+       SET status = ?,
+           locked_at = NULL,
+           locked_by = NULL,
+           error_message = COALESCE(?, error_message)
+       WHERE id = ?`,
+      [status, errorMessage, id]
+    );
+  }
+
+  /**
+   * Startup recovery: move any 'uploading' row that does not have a live lock
+   * into 'reconciliation_required' and clear the stale lock fields.
+   *
+   * A lock is considered live if locked_at is present AND within the last
+   * 15 minutes (the same window used by claimPublishScheduleItem).  Any
+   * row outside that window was left by a process that died mid-upload —
+   * the YouTube outcome is unknown and must be reconciled before retrying.
+   *
+   * The existing error_message (evidence) is preserved; a recovery note is
+   * prepended when none is already set.
+   *
+   * Returns the count of rows transitioned.
+   */
+
 
   // Analytics methods
   async saveAnalyticsReport(report) {

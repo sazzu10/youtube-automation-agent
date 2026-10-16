@@ -68,6 +68,19 @@ const AI_PROVIDER_GUIDE = {
     },
     validationCreds: (apiKey, model) => ({ aiProvider: { provider: 'openrouter', apiKey, model } })
   },
+  groq: {
+    label: 'Groq — fast open-weight inference',
+    keyUrl: 'https://console.groq.com/keys',
+    keyHint: 'starts with "gsk_"',
+    instructions: ['Create an account on console.groq.com', 'Create an API key in the console'],
+    models: [...PROVIDERS.groq.models],
+    defaultModel: PROVIDERS.groq.defaultModel,
+    covers: 'scripts only (add a Gemini or OpenAI key for images/voice)',
+    save(credentials, apiKey, model) {
+      credentials.aiProvider = { provider: 'groq', apiKey, model };
+    },
+    validationCreds: (apiKey, model) => ({ aiProvider: { provider: 'groq', apiKey, model } })
+  },
   kimi: {
     label: 'Kimi (Moonshot AI) — K3 and K2 family text models',
     keyUrl: 'https://platform.kimi.ai',

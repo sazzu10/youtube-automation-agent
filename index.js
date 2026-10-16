@@ -14,6 +14,10 @@ const { ProductionManagementAgent } = require('./agents/production-management-ag
 const { PublishingSchedulingAgent } = require('./agents/publishing-scheduling-agent');
 const { AnalyticsOptimizationAgent } = require('./agents/analytics-optimization-agent');
 const { DailyAutomation } = require('./schedules/daily-automation');
+const { InstagramWorker } = require('./integrations/instagram/worker');
+const { InboxScanner } = require('./integrations/content/inbox-scanner');
+const { PublicMediaServer } = require('./integrations/content/public-server');
+const { InboxProductionBridge } = require('./integrations/content/inbox-production-bridge');
 const { OperatorService } = require('./utils/operator-service');
 const { AutonomousChannelOperator } = require('./utils/autonomous-channel-operator');
 const { ActivationMetrics } = require('./utils/activation-metrics');
@@ -27,6 +31,7 @@ const { AudienceEngagementService } = require('./utils/audience-engagement-servi
 const { GrowthExperimentService } = require('./utils/growth-experiment-service');
 const { AITextService } = require('./utils/ai-text-service');
 const { DiscoverabilityService } = require('./utils/discoverability-service');
+const { YouTubeOrchestrator } = require('./agents/orchestration/youtube-orchestrator');
 const { version } = require('./package.json');
 const chalk = require('chalk');
 
@@ -51,6 +56,11 @@ class YouTubeAutomationAgent {
     this.engagement = null;
     this.experiments = null;
     this.discoverability = null;
+    this.orchestrator = null;
+    this.instagramWorker = new InstagramWorker({ logger: this.logger });
+    this.inboxScanner = new InboxScanner({ logger: this.logger });
+    this.publicMediaServer = new PublicMediaServer({ logger: this.logger });
+    this.inboxProductionBridge = null;
     this.setupRequired = false;
   }
 
@@ -63,7 +73,6 @@ class YouTubeAutomationAgent {
       this.logger.info('Initializing database...');
       this.db = new Database();
       await this.db.initialize();
-      await this.db.markInterruptedJobs();
       this.recovery = new GenerationRecoveryService(this.db, {
         logger: this.logger,
         updateJobStage: (...args) => this.updateJobStage(...args)
@@ -103,6 +112,16 @@ class YouTubeAutomationAgent {
       // Initialize agents
       this.logger.info('Initializing agents...');
       await this.initializeAgents();
+
+      this.inboxProductionBridge = new InboxProductionBridge({
+        db: this.db,
+        publishing: this.agents.publishing,
+        instagramQueue: require('./integrations/instagram/queue'),
+        aiTextService: new AITextService(this.credentials?.credentials || {}),
+        trendSource: this.agents.strategy,
+        publicMediaServer: this.publicMediaServer,
+        logger: this.logger
+      });
       this.scenes = this.agents.production?.sceneRepair || new SceneRepairService(
         this.db,
         this.agents.production?.aiVideoGenerator,
@@ -122,6 +141,20 @@ class YouTubeAutomationAgent {
         { logger: this.logger }
       );
 
+      // Advisory orchestration layer.
+      // This does not control generation or publishing yet.
+      this.orchestrator = new YouTubeOrchestrator({
+        db: this.db,
+        agents: this.agents,
+        services: {
+          experiments: this.experiments,
+          learning: this.agents.analytics?.learning || null
+        },
+        notify: notification => this.operator.notify(notification)
+      });
+
+      this.logger.info('✓ YouTube orchestrator initialized in advisory mode');
+
       // Show which pipeline stages will run for real vs. be simulated
       const capabilities = await this.logCapabilitySummary();
       if (capabilities.hasText && capabilities.hasFFmpeg && capabilities.hasUpload) {
@@ -136,7 +169,11 @@ class YouTubeAutomationAgent {
       this.scheduler = new DailyAutomation(this.agents, this.db, {
         generateContent: input => this.queueScheduledContent(input),
         engagement: this.engagement,
-        experiments: this.experiments
+        experiments: this.experiments,
+        instagramWorker: this.instagramWorker,
+        inboxScanner: this.inboxScanner,
+        inboxProductionBridge: this.inboxProductionBridge,
+        publicMediaServer: this.publicMediaServer
       });
       await this.scheduler.initialize();
 
@@ -374,6 +411,7 @@ class YouTubeAutomationAgent {
   }
   setupAPI() {
     this.app.use(express.json({ limit: '1mb' }));
+    this.app.use('/vidiq', require('./routes/vidiq'));
     this.app.use(express.static(path.join(__dirname, 'dashboard')));
 
     if (!process.env.API_KEY) {
@@ -863,6 +901,31 @@ class YouTubeAutomationAgent {
         return res.json({ success: true, result: await this.db.saveChannelStrategy(strategy) });
       } catch (error) {
         return res.status(400).json({ success: false, error: error.message });
+      }
+    });
+
+    this.app.get('/api/orchestrator/inspect', protect, async (_req, res) => {
+      try {
+        if (!this.orchestrator) {
+          return res.status(503).json({
+            success: false,
+            error: 'Orchestrator is not initialized'
+          });
+        }
+
+        const strategy = await this.db.getChannelStrategy() || {};
+        const result = await this.orchestrator.inspect(strategy);
+
+        return res.json({
+          success: true,
+          result
+        });
+      } catch (error) {
+        this.logger.error('Orchestrator inspection failed:', error);
+        return res.status(500).json({
+          success: false,
+          error: error.message
+        });
       }
     });
 
@@ -1832,7 +1895,7 @@ class YouTubeAutomationAgent {
     }
     
     const PORT = process.env.PORT || 3456;
-    this.app.listen(PORT, () => {
+    this.server = this.app.listen(PORT, async () => {
       console.log(chalk.green(`\n✅ YouTube Automation Agent running on port ${PORT}`));
       console.log(chalk.gray('─'.repeat(50)));
       console.log(chalk.white('📊 Dashboard: ') + chalk.cyan(`http://localhost:${PORT}`));
@@ -1845,7 +1908,28 @@ class YouTubeAutomationAgent {
       } else {
         console.log(chalk.yellow('\n🤖 Automation is active. Approved content will be published on schedule.'));
       }
+
+      if (this.publicMediaServer) {
+        try {
+          await this.publicMediaServer.start();
+          this.logger.info('✓ Public media server (port 8787) and Cloudflare tunnel started');
+        } catch (mediaErr) {
+          this.logger.warn(`Public media server startup warning: ${mediaErr.message}`);
+        }
+      }
     });
+
+    const shutdown = async () => {
+      if (this.publicMediaServer) {
+        try { await this.publicMediaServer.stop(); } catch (_) {}
+      }
+      if (this.server) {
+        this.server.close();
+      }
+      process.exit(0);
+    };
+    process.once('SIGTERM', shutdown);
+    process.once('SIGINT', shutdown);
   }
 }
 

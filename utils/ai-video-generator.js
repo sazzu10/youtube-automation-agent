@@ -78,7 +78,14 @@ class AIVideoGenerator {
       } else if (this.gemini) {
         provider = 'gemini';
         model = process.env.GEMINI_TTS_MODEL || 'gemini-3.1-flash-tts-preview';
-        generatedPath = await this.generateGeminiTTS(text, outputPath);
+        for (let n = 1; ; n++) {
+          try { generatedPath = await this.generateGeminiTTS(text, outputPath); break; }
+          catch (e) {
+            if (n >= 3) throw e;
+            this.logger.warn('Gemini TTS try ' + n + ' failed (' + (e && e.message) + '), retrying...');
+            await new Promise(r => setTimeout(r, 5000 * n));
+          }
+        }
       } else {
         generatedPath = await this.simulateTTSGeneration(text, outputPath);
       }
@@ -101,7 +108,7 @@ class AIVideoGenerator {
         generatedAt: new Date().toISOString(), simulated: false, error: error.message,
         cost: { provider, amount: null, currency: null, invoiceRequired: provider !== 'simulation' }
       };
-      this.logger.error('TTS generation failed:', error);
+      this.logger.error('TTS generation failed: ' + (error && error.message), error);
       throw error;
     }
   }
@@ -211,7 +218,7 @@ class AIVideoGenerator {
       this.logger.info(`Generated ${localPaths.length} visual assets`);
       return localPaths;
     } catch (error) {
-      this.logger.error('Visual asset generation failed:', error);
+      this.logger.error(`Visual asset generation failed: ${error && error.message ? error.message : JSON.stringify(error)}`, error);
       return await this.simulateVisualAssets(prompt, style, count);
     }
   }
@@ -358,46 +365,45 @@ class AIVideoGenerator {
         }
       }
 
-      const produced = await this.generateSlideshowVideo(script, visualAssets, audioPath, outputPath);
-      this.lastVideoResult = { requestedProvider: 'slideshow', actualProvider: 'slideshow', model: 'local-ffmpeg', mode: 'slideshow', generatedSeconds: 0, tasks: [], scenes: [] };
-      return produced;
+      throw new Error('No real AI video clips were generated; slideshow fallback is disabled.');
     } catch (error) {
       // The Logger's console line only shows the message string, so put the real
       // reason inline. Previously the stack alone went to the file transport and
       // the console printed "Video generation failed:" with no detail.
       const reason = error && error.message ? error.message : String(error);
-      this.logger.error(`Video provider generation failed; using the local slideshow: ${reason}`, error);
-      try {
-        const produced = await this.generateSlideshowVideo(script, visualAssets, audioPath, outputPath);
-        this.lastVideoResult = {
-          requestedProvider: this.lastVideoResult?.requestedProvider || 'configured-provider',
-          actualProvider: 'slideshow', model: 'local-ffmpeg', mode: 'fallback', generatedSeconds: 0,
-          fallbackReason: reason, tasks: [], scenes: []
-        };
-        return produced;
-      } catch (fallbackError) {
-        this.logger.error(`Local slideshow fallback failed: ${fallbackError.message}`, fallbackError);
-        const produced = await this.simulateVideoGeneration(script, visualAssets, audioPath, outputPath);
-        this.lastVideoResult = {
-          requestedProvider: 'configured-provider', actualProvider: 'simulation', model: null,
-          mode: 'simulation', generatedSeconds: 0, fallbackReason: `${reason}; ${fallbackError.message}`, tasks: [], scenes: []
-        };
-        return produced;
-      }
+      this.logger.error(`Real AI video generation failed; no fallback video will be published: ${reason}`, error);
+      this.lastVideoResult = {
+        requestedProvider: this.lastVideoResult?.requestedProvider || 'configured-provider',
+        actualProvider: 'failed',
+        model: null,
+        mode: 'failed',
+        generatedSeconds: 0,
+        fallbackReason: reason,
+        tasks: [],
+        scenes: []
+      };
+      throw error;
     }
   }
 
   async generateHybridVideo(clips, visualAssets, audioPath, outputPath, totalDuration) {
     if (!(await checkFFmpeg())) throw new Error(ffmpegInstallHint());
-    const validImages = await this.filterLocalImageAssets(visualAssets);
-    const segments = clips.map(clip => ({ type: 'video', path: clip.path, duration: clip.duration }));
+    const segments = clips
+      .filter(clip => clip && clip.path && Number(clip.duration) > 0)
+      .map(clip => ({ type: 'video', path: clip.path, duration: Number(clip.duration) }));
+
     const generatedDuration = segments.reduce((sum, item) => sum + item.duration, 0);
-    const remaining = Math.max(0, this.parseDurationSeconds(totalDuration) - generatedDuration);
-    if (remaining && validImages.length) {
-      const perImage = Math.max(2, remaining / validImages.length);
-      for (const imagePath of validImages) segments.push({ type: 'image', path: imagePath, duration: perImage });
+    const requestedDuration = this.parseDurationSeconds(totalDuration);
+
+    if (!segments.length) {
+      throw new Error('No usable real AI video clips were generated');
     }
-    if (!segments.length) throw new Error('No usable provider clips or still images were generated');
+
+    if (requestedDuration > 0 && generatedDuration < Math.min(requestedDuration * 0.75, requestedDuration - 1)) {
+      throw new Error(
+        `Insufficient real-motion coverage: generated ${generatedDuration.toFixed(2)}s of requested ${requestedDuration.toFixed(2)}s`
+      );
+    }
 
     const visualPath = outputPath.replace(/\.mp4$/i, '_hybrid_visual.mp4');
     await this.renderMediaTimeline(segments, visualPath);
@@ -467,58 +473,137 @@ class AIVideoGenerator {
   }
 
   async generateSlideshowVideo(script, visualAssets, audioPath, outputPath) {
-    this.logger.info('Creating slideshow video...');
+    this.logger.info('Creating Android-compatible slideshow video...');
 
     if (!(await checkFFmpeg())) {
       throw new Error(ffmpegInstallHint());
     }
 
-    const { chromium } = require('playwright');
-    const browser = await chromium.launch();
+    const sharp = require('sharp');
     const slidesDir = path.join(path.dirname(outputPath), 'slides');
+    await fs.mkdir(slidesDir, { recursive: true });
 
-    try {
-      const page = await browser.newPage();
-      await page.setViewportSize({ width: 1920, height: 1080 });
+    const esc = (v) => String(v ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&apos;');
 
-      // Create HTML for slideshow (only real image files can be embedded)
-      const imageAssets = await this.filterImageAssets(visualAssets);
-      await page.setContent(this.createSlideshowHTML(script, imageAssets));
-
-      // Freeze CSS transitions/animations so each still is captured fully rendered
-      await page.addStyleTag({ content: '* { transition: none !important; animation: none !important; }' });
-      await page.waitForTimeout(1000); // Wait for assets to load
-
-      // Capture ONE still per slide instead of screenshotting at 30fps —
-      // FFmpeg turns the stills into a crossfaded video in seconds.
-      const slideCount = await page.evaluate(() => document.querySelectorAll('.slide').length);
-      await fs.mkdir(slidesDir, { recursive: true });
-
-      const stills = [];
-      for (let i = 0; i < slideCount; i++) {
-        await page.evaluate((index) => {
-          document.querySelectorAll('.slide').forEach((slide, s) => {
-            slide.classList.toggle('active', s === index);
-          });
-        }, i);
-
-        const stillPath = path.join(slidesDir, `slide_${String(i).padStart(3, '0')}.png`);
-        await page.screenshot({ path: stillPath });
-        stills.push(stillPath);
+    const wrap = (text, max = 42) => {
+      const words = String(text ?? '').split(/\s+/).filter(Boolean);
+      const lines = [];
+      let line = '';
+      for (const word of words) {
+        const next = line ? line + ' ' + word : word;
+        if (next.length > max && line) {
+          lines.push(line);
+          line = word;
+        } else {
+          line = next;
+        }
       }
+      if (line) lines.push(line);
+      return lines.slice(0, 7);
+    };
 
-      const videoPath = outputPath.replace('.mp4', '_visual.mp4');
-      const duration = this.calculateScriptDuration(script);
-      await this.renderSlidesToVideo(stills, duration, videoPath);
+    const imageData = async (file) => {
+      try {
+        if (!file || typeof file !== 'string' || !require("fs").existsSync(file)) return null;
+        const ext = path.extname(file).toLowerCase();
+        const mime = ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg'
+          : ext === '.webp' ? 'image/webp' : 'image/png';
+        const b64 = (await fs.readFile(file)).toString('base64');
+        return `data:${mime};base64,${b64}`;
+      } catch {
+        return null;
+      }
+    };
 
-      // Add audio
-      await this.addAudioToVideo(videoPath, audioPath, outputPath);
+    const slides = [];
+    slides.push({
+      title: script.title || 'AI Trends & Tools',
+      body: script.hook?.text || script.introduction?.topicIntro || 'Discover useful AI tools and trends.',
+      image: visualAssets?.[0]
+    });
 
-      return outputPath;
-    } finally {
-      await browser.close().catch(() => {});
-      await this.cleanupDirectory(slidesDir);
+    if (script.mainContent?.sections) {
+      script.mainContent.sections.forEach((section, index) => {
+        let body = '';
+        if (Array.isArray(section.items)) {
+          body = section.items.slice(0, 5).map((x, i) =>
+            `${i + 1}. ${x.title || ''}${x.description ? ': ' + x.description : ''}`
+          ).join('\n');
+        } else if (Array.isArray(section.steps)) {
+          body = section.steps.slice(0, 5).map((x, i) =>
+            `${i + 1}. ${x.title || ''}${x.description ? ': ' + x.description : ''}`
+          ).join('\n');
+        } else {
+          body = typeof section.content === 'string'
+            ? section.content.slice(0, 450)
+            : 'Content coming soon...';
+        }
+
+        slides.push({
+          title: section.title || `AI Tool ${index + 1}`,
+          body,
+          image: visualAssets?.[Math.min(index + 1, Math.max(visualAssets.length - 1, 0))]
+        });
+      });
     }
+
+    slides.push({
+      title: 'Subscribe for More Stories ✨',
+      body: 'New AI content, tools and technology updates every day.'
+    });
+
+    const stills = [];
+
+    for (let i = 0; i < slides.length; i++) {
+      const slide = slides[i];
+      const data = await imageData(slide.image);
+      const bodyLines = wrap(slide.body, 48);
+
+      const image = data
+        ? `<image href="${data}" x="0" y="0" width="1920" height="1080" preserveAspectRatio="xMidYMid slice"/>`
+        : '';
+
+      const textLines = bodyLines.map((line, n) =>
+        `<text x="160" y="${610 + n * 58}" font-size="38" fill="white">${esc(line)}</text>`
+      ).join('');
+
+      const svg = `
+        <svg width="1920" height="1080" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0%" stop-color="#151a3a"/>
+              <stop offset="100%" stop-color="#4f46a5"/>
+            </linearGradient>
+          </defs>
+          <rect width="1920" height="1080" fill="url(#bg)"/>
+          ${image}
+          <rect x="90" y="100" width="1740" height="850" rx="36" fill="rgba(0,0,0,0.58)"/>
+          <text x="160" y="300" font-family="Arial,sans-serif" font-size="68" font-weight="bold" fill="white">${esc(slide.title)}</text>
+          ${textLines}
+        </svg>`;
+
+      const stillPath = path.join(slidesDir, `slide_${String(i).padStart(2, '0')}.png`);
+      await sharp(Buffer.from(svg)).png().toFile(stillPath);
+      stills.push(stillPath);
+    }
+
+    const videoPath = outputPath.replace('.mp4', '_visual.mp4');
+    let totalDuration = this.calculateScriptDuration(script);
+    try {
+      const cp = require('child_process');
+      const args = ['-v','error','-show_entries','format=duration','-of','default=nw=1:nk=1', audioPath];
+      const d = parseFloat(cp.execFileSync('ffprobe', args).toString().trim());
+      if (d > 0) totalDuration = d;
+    } catch (e) {}
+    await this.renderSlidesToVideo(stills, totalDuration, videoPath);
+
+    await this.addAudioToVideo(videoPath, audioPath, outputPath);
+    return outputPath;
   }
 
   async renderSlidesToVideo(stills, totalDuration, videoPath) {
@@ -526,36 +611,52 @@ class AIVideoGenerator {
       throw new Error('No slides to render');
     }
 
-    const fade = 0.5;
+    const fade = 0.01;
     const perSlide = Math.max(2, totalDuration / stills.length);
 
     const args = ['-y'];
     for (const still of stills) {
-      args.push('-loop', '1', '-t', perSlide.toFixed(2), '-framerate', '30', '-i', still);
+      args.push('-loop', '1', '-framerate', '30', '-t', perSlide.toFixed(2), '-i', still);
     }
 
     if (stills.length === 1) {
-      args.push('-vf', 'format=yuv420p', '-c:v', 'libx264', videoPath);
+      args.push(
+        '-vf', 'format=yuv420p',
+        '-c:v', 'libx264',
+        '-profile:v', 'high',
+        '-level:v', '4.0',
+        '-pix_fmt', 'yuv420p',
+        '-r', '30',
+        '-b:v', '3500k',
+        '-maxrate', '3500k',
+        '-bufsize', '7000k',
+        '-movflags', '+faststart',
+        '-c:a', 'aac',
+        '-b:a', '128k',
+        '-ar', '48000',
+        videoPath
+      );
       await runFFmpeg(args);
       return videoPath;
     }
 
-    // Chain crossfades: transition k starts fade seconds before slide k ends
-    const filters = [];
-    let prev = '[0:v]';
-    for (let i = 1; i < stills.length; i++) {
-      const out = `[v${i}]`;
-      const offset = (i * (perSlide - fade)).toFixed(2);
-      filters.push(`${prev}[${i}:v]xfade=transition=fade:duration=${fade}:offset=${offset}${out}`);
-      prev = out;
-    }
-    filters.push(`${prev}format=yuv420p[vfinal]`);
-
+    const filters = stills.map((_, i) => '[' + i + ':v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p,setpts=PTS-STARTPTS[v' + i + ']');
+    filters.push(stills.map((_, i) => '[v' + i + ']').join('') + 'concat=n=' + stills.length + ':v=1:a=0[vfinal]');
     args.push(
       '-filter_complex', filters.join(';'),
       '-map', '[vfinal]',
       '-c:v', 'libx264',
+      '-profile:v', 'high',
+      '-level:v', '4.0',
+      '-pix_fmt', 'yuv420p',
       '-r', '30',
+      '-b:v', '3500k',
+      '-maxrate', '3500k',
+      '-bufsize', '7000k',
+      '-movflags', '+faststart',
+      '-c:a', 'aac',
+      '-b:a', '128k',
+      '-ar', '48000',
       videoPath
     );
 
@@ -929,21 +1030,17 @@ class AIVideoGenerator {
 
   async simulateVisualAssets(prompt, style, count) {
     this.logger.info(`Simulating ${count} visual assets...`);
-    
+    const sharp = require('sharp');
     const paths = [];
     for (let i = 0; i < count; i++) {
-      const assetPath = path.join(__dirname, '..', 'data', 'assets', `visual_sim_${Date.now()}_${i}.info`);
-      
-      await fs.writeFile(assetPath, JSON.stringify({
-        message: 'AI visual asset would be generated here',
-        prompt: prompt,
-        style: style,
-        timestamp: new Date().toISOString()
-      }, null, 2));
-      
-      paths.push(assetPath);
+      const dir = path.join(__dirname, '..', 'data', 'assets');
+      await fs.mkdir(dir, { recursive: true });
+      const p = path.join(dir, `visual_sim_${Date.now()}_${i}.png`);
+      const bg = { r: 30, g: 58, b: 138 };
+      const img = { create: { width: 1280, height: 720, channels: 3, background: bg } };
+      await sharp(img).png().toFile(p);
+      paths.push(p);
     }
-    
     return paths;
   }
 

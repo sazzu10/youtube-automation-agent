@@ -181,6 +181,25 @@ class MediaGenerationService {
         status: error.code === 'JOB_CANCELLED' ? 'cancelled' : 'failed',
         error: safeModelError(error), completedAt: new Date().toISOString()
       });
+      if (
+        provider.id === 'agnes' &&
+        error.code !== 'JOB_CANCELLED'
+      ) {
+        const fallback = this.registry.get('magic_hour');
+        if (fallback?.isAvailable() && fallback.supports(request)) {
+          this.logger.warn('Agnes failed; falling back to Magic Hour');
+          const fallbackPath = outputPath.replace('_agnes_', '_magic_hour_');
+          return this.generateClip({
+            jobId,
+            productionId,
+            scene,
+            provider: fallback,
+            outputPath: fallbackPath,
+            request
+          });
+        }
+      }
+
       throw error;
     }
   }

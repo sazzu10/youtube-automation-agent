@@ -158,11 +158,20 @@ class SceneRepairService {
     }
     const directory = path.join(this.dataRoot, 'audio', 'scenes', production.id);
     await fs.mkdir(directory, { recursive: true });
+    try {
+      const actual = await this.getMediaDuration(audioPath);
+      const planned = scenes.reduce((a, x) => a + Number(x.duration || 0), 0);
+      if (actual > 0 && planned > 0 && Math.abs(actual - planned) > 1) {
+        const r = actual / planned;
+        for (const x of scenes) x.duration = Math.max(2, Number((Number(x.duration) * r).toFixed(2)));
+      }
+    } catch (e) {}
     let start = 0;
     for (const scene of scenes) {
       const output = path.join(directory, `${String(scene.position).padStart(3, '0')}_r1.mp3`);
       try {
         await runFFmpeg(['-y', '-ss', start.toFixed(2), '-t', Number(scene.duration).toFixed(2), '-i', audioPath, '-vn', '-c:a', 'libmp3lame', output]);
+        if ((await fs.stat(output)).size < 2000) throw new Error('Narration segment is empty');
         scene.audioPath = output;
         scene.narrationStatus = 'current';
         scene.narrationProvider = audio.provider || null;

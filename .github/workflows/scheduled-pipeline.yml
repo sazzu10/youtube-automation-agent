@@ -1,0 +1,75 @@
+name: Scheduled YouTube Shorts Automation
+
+on:
+  schedule:
+    # 6 daily triggers corresponding to peak US audience windows (America/Los_Angeles):
+    # 07:00 PDT -> 14:00 UTC
+    # 10:00 PDT -> 17:00 UTC
+    # 13:00 PDT -> 20:00 UTC
+    # 16:00 PDT -> 23:00 UTC
+    # 19:00 PDT -> 02:00 UTC
+    # 21:00 PDT -> 04:00 UTC
+    - cron: '0 14,17,20,23,2,4 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run mode (validate pipeline without live publishing)'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: youtube-shorts-pipeline
+  cancel-in-progress: false
+
+jobs:
+  run-pipeline-cycle:
+    name: Execute Shorts Pipeline Cycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+
+      - name: Restore SQLite Database Cache
+        uses: actions/cache@v4
+        with:
+          path: data/youtube_automation.db
+          key: youtube-db-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            youtube-db-${{ runner.os }}-
+
+      - name: Execute Pipeline Cycle
+        env:
+          NODE_ENV: production
+          DAILY_CONTENT_GENERATION: on
+          YOUTUBE_DAILY_TARGET: 6
+          YOUTUBE_REGION: US
+          YOUTUBE_TIMEZONE: America/Los_Angeles
+          CHANNEL_TIMEZONE: America/Los_Angeles
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          AGNES_API_KEY: ${{ secrets.AGNES_API_KEY }}
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          YOUTUBE_CREDENTIALS_JSON: ${{ secrets.YOUTUBE_CREDENTIALS_JSON }}
+          YOUTUBE_TOKENS_JSON: ${{ secrets.YOUTUBE_TOKENS_JSON }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
+        run: npm run pipeline:cycle

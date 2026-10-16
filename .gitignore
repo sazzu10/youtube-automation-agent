@@ -90,3 +90,15 @@ data/thumbnails/
 
 # Claude worktrees
 .claude/worktrees/
+
+config/instagram.json
+
+# Local keys, sqlite files, backups, and temporary test scripts
+.gemini-key*
+*.bak*
+*.backup*
+*.mcp-backup
+test-*.js
+database/*.sqlite
+instagram-public/
+content/

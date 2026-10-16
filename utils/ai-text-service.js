@@ -47,7 +47,7 @@ const PROVIDERS = {
     name: 'OpenRouter',
     baseURL: 'https://openrouter.ai/api/v1',
     defaultModel: 'openai/gpt-5.6-sol',
-    models: ['openai/gpt-5.6-sol', 'anthropic/claude-fable-5', 'google/gemini-3.8-flash', 'moonshotai/kimi-k3', 'z-ai/glm-5.3'],
+    models: ['openai/gpt-5.6-sol', 'anthropic/claude-fable-5', 'google/gemini-3.7-flash', 'moonshotai/kimi-k3', 'z-ai/glm-5.3'],
     envKey: 'OPENROUTER_API_KEY',
   },
   groq: {
@@ -222,11 +222,9 @@ class AITextService {
     const temperature = options.temperature ?? 0.7;
 
     // 1. If Gemini is primary provider (or requested)
-    if (this.gemini || (!this.client && this.keyRotator.getKeyCount() > 0)) {
+    if ((!this.client && (this.gemini || (this.keyRotator && this.keyRotator.getKeyCount() > 0))) || options.provider === 'gemini') {
       try {
-        return await this.keyRotator.executeWithRotation(async (apiKey) => {
-          const { GoogleGenAI } = require('@google/genai');
-          const client = new GoogleGenAI({ apiKey });
+        const invokeGemini = async (client) => {
           const config = { maxOutputTokens: maxTokens };
           if (!/^gemini-3\.(?:[5-9]|\d{2,})-/.test(model)) config.temperature = temperature;
 
@@ -242,7 +240,18 @@ class AITextService {
             );
           }
           return text.trim();
-        });
+        };
+
+        if (this.gemini) {
+          return await invokeGemini(this.gemini);
+        }
+        if (this.keyRotator) {
+          return await this.keyRotator.executeWithRotation(async (apiKey) => {
+            const { GoogleGenAI } = require('@google/genai');
+            const client = new GoogleGenAI({ apiKey });
+            return await invokeGemini(client);
+          });
+        }
       } catch (error) {
         if (this.cloudflareAI) {
           this.logger.warn('Primary AI failed; using Cloudflare Workers AI fallback:', error.message);
@@ -281,6 +290,9 @@ class AITextService {
           max_tokens: maxTokens,
         });
         return this._extractContent(response);
+      }
+      if (/empty response/i.test(error.message || '')) {
+        throw error;
       }
       if (this.cloudflareAI) {
         this.logger.warn('Primary AI failed; using Cloudflare Workers AI fallback:', error.message);

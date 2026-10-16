@@ -95,11 +95,11 @@ class SEOOptimizerAgent {
       return null;
     }
 
-    const prompt = `You are optimizing YouTube metadata.
-Return only valid JSON with this exact shape:
+    const prompt = `You are optimizing YouTube metadata for a short-form video.
+Return ONLY valid JSON with this exact shape:
 {
-  "title": "SEO title under 100 characters",
-  "description": "YouTube description with useful summary and timestamps if relevant",
+  "title": "unique SEO title under 100 characters",
+  "description": "unique engaging description",
   "tags": ["tag"]
 }
 
@@ -109,7 +109,30 @@ Angle: ${strategy.angle}
 Content type: ${strategy.contentType}
 Target audience: ${strategy.targetAudience}
 Keywords: ${(strategy.keywords || []).join(', ')}
-Keep tags under YouTube's 500 character total guidance. Avoid fabricated statistics and unsupported claims.`;
+
+DESCRIPTION RULES:
+- Write a fresh description specifically for THIS video.
+- Do not reuse generic/template wording from other videos.
+- Start with a strong first sentence that creates curiosity about the actual topic.
+- Naturally include 2-4 relevant keywords from the supplied context.
+- Clearly describe what the viewer will see or learn.
+- Keep it concise and suitable for YouTube Shorts.
+- You may use 1-3 relevant emojis when natural.
+- Do not stuff keywords.
+- Do not use fake claims, fake statistics, fake urgency, or misleading promises.
+- Do not blindly use phrases like "go viral", "trending now", "you won't believe", or "must watch".
+- Do not mention AI tools or how the video was produced.
+
+TITLE RULES:
+- Make the title specific to the actual video.
+- Avoid repeating the exact same title structure across videos.
+- Keep it under 100 characters.
+
+TAGS:
+- Keep tags relevant to the actual topic.
+- Avoid unrelated generic filler.
+- Keep the total tags under YouTube's 500 character guidance.
+- Avoid fabricated or unsupported claims.`;
 
     try {
       const response = await this.aiTextService.generateText(prompt, {
@@ -450,51 +473,90 @@ Keep tags under YouTube's 500 character total guidance. Avoid fabricated statist
   }
 
   async generateHashtags(strategy) {
-    const hashtags = [];
-    
-    // Primary hashtag
-    const primaryHashtag = `#${strategy.topic.replace(/\s+/g, '')}`;
-    hashtags.push(primaryHashtag);
-    
-    // Content type hashtag
-    hashtags.push(`#${strategy.contentType.toLowerCase()}`);
-    
-    // Trending hashtags
-    const trendingHashtags = [
-      '#youtube',
-      '#youtuber',
-      '#subscribe',
-      '#video',
-      '#viral',
-      '#trending',
-      '#new'
-    ];
-    
-    // Niche hashtags
-    const niche = this.identifyNiche(strategy);
-    const nicheHashtags = {
-      'technology': ['#tech', '#technology', '#innovation'],
-      'gaming': ['#gaming', '#gamer', '#games'],
-      'education': ['#education', '#learning', '#study'],
-      'business': ['#business', '#entrepreneur', '#success'],
-      'lifestyle': ['#lifestyle', '#life', '#daily'],
-      'health': ['#health', '#fitness', '#wellness'],
-      'entertainment': ['#entertainment', '#fun', '#funny']
-    };
-    
-    const selectedNicheHashtags = nicheHashtags[niche] || [];
-    hashtags.push(...selectedNicheHashtags.slice(0, 2));
-    
-    // Add 2-3 trending hashtags
-    hashtags.push(...trendingHashtags.slice(0, 3));
-    
-    // Year hashtag
-    hashtags.push(`#${new Date().getFullYear()}`);
-    
-    // Limit to 15 hashtags (YouTube recommendation)
-    return hashtags.slice(0, 15);
-  }
+    const fallback = () => {
+      const clean = value => String(value || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '')
+        .trim();
 
+      const topic = clean(strategy.topic);
+      const type = clean(strategy.contentType);
+      const keywords = Array.isArray(strategy.keywords) ? strategy.keywords : [];
+
+      const nicheMap = {
+        technology: ['#tech','#technology','#innovation','#gadgets'],
+        gaming: ['#gaming','#gamer','#gameplay','#gamingcommunity'],
+        education: ['#education','#learning','#howto','#tutorial'],
+        business: ['#business','#entrepreneur','#businesstips','#startup'],
+        lifestyle: ['#lifestyle','#lifehacks','#dailylife','#productivity'],
+        health: ['#health','#fitness','#wellness','#healthtips'],
+        entertainment: ['#entertainment','#funny','#fun','#entertainmentnews'],
+        crafting: ['#diy','#crafts','#handmade','#crafting','#upcycling'],
+        general: ['#shorts','#reels','#creative','#interesting']
+      };
+
+      const niche = this.identifyNiche(strategy);
+      const values = [
+        topic ? '#' + topic : '',
+        type ? '#' + type : '',
+        ...keywords.slice(0,4).map(clean).filter(Boolean).map(x => '#' + x),
+        ...(nicheMap[niche] || nicheMap.general).slice(0,3),
+        '#shorts'
+      ];
+
+      return [...new Set(values)].slice(0,10);
+    };
+
+    if (!this.aiTextService.isAvailable()) {
+      return fallback();
+    }
+
+    const prompt = `Generate 6 to 10 UNIQUE, highly relevant social-media hashtags for this video.
+Return ONLY a JSON array of hashtag strings. No explanation.
+
+Topic: ${strategy.topic}
+Angle: ${strategy.angle || ''}
+Content type: ${strategy.contentType || ''}
+Audience: ${strategy.targetAudience || ''}
+Keywords: ${(strategy.keywords || []).join(', ')}
+
+Rules:
+- Every hashtag must directly relate to the video's actual subject.
+- Mix specific niche hashtags with broader relevant discovery hashtags.
+- Do NOT use generic filler hashtags such as #viral, #fyp, #trending, #subscribe, #follow, #new or #youtube unless genuinely relevant.
+- Do NOT repeat hashtags.
+- Do NOT invent unrelated trends.
+- Use normal hashtag spelling, no spaces inside a hashtag.
+- Prefer 6-10 strong hashtags over a long list.`;
+
+    try {
+      const response = await this.aiTextService.generateText(prompt, {
+        maxTokens: 500,
+        temperature: 0.8
+      });
+
+      const parsed = this.parseAIJsonResponse(response);
+      const raw = Array.isArray(parsed) ? parsed : parsed.hashtags;
+      if (!Array.isArray(raw)) throw new Error('Invalid hashtag response');
+
+      const cleaned = raw
+        .map(x => String(x).trim().replace(/^#+/, '').replace(/[^a-zA-Z0-9_]+/g, ''))
+        .filter(Boolean)
+        .map(x => '#' + x);
+
+      const unique = [...new Set(cleaned)].slice(0,10);
+
+      if (unique.length >= 4) {
+        this.logger.info(`Generated ${unique.length} dynamic hashtags via ${this.aiTextService.providerName}`);
+        return unique;
+      }
+
+      return fallback();
+    } catch (error) {
+      this.logger.warn(`Dynamic hashtag generation failed; using fallback: ${error.message}`);
+      return fallback();
+    }
+  }
   async generateChapters(script) {
     const chapters = [];
     let currentTime = 0;

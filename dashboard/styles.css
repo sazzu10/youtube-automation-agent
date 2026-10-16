@@ -765,10 +765,9 @@ label:has(input:disabled) > span { color: var(--muted); }
    PRODUCTION LAYER — ambience, choreography, palette, glow
    ============================================================ */
 
-/* ---------- Preboot gate ---------- */
-.preboot body { opacity: 0; }
-html:not(.preboot) body { animation: boot-in .55s cubic-bezier(.2, .7, .3, 1); }
-@keyframes boot-in { from { opacity: 0; transform: translateY(8px) scale(.995); } }
+/* ---------- Preboot gate removed for immediate direct render ---------- */
+.preboot body { opacity: 1; }
+body { opacity: 1; }
 
 /* ---------- Aurora ambience ---------- */
 .aurora {

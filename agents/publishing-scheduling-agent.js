@@ -4,6 +4,16 @@ const fsSync = require('fs');
 const path = require('path');
 const { Logger } = require('../utils/logger');
 const { assertValidYouTubeMetadata } = require('../utils/youtube-metadata-validator');
+const {
+  computeFileContentHash,
+  checkDuplicatePublish
+} = require('../utils/content-identity');
+const {
+  getNextAvailableScheduleSlot,
+  getTimezone,
+  getLocalDateString,
+  getDailyTarget
+} = require('../utils/schedule-calculator');
 
 class PublishingSchedulingAgent {
   constructor(db, credentials) {
@@ -12,12 +22,16 @@ class PublishingSchedulingAgent {
     this.logger = new Logger('PublishingScheduling');
     this.youtube = null;
     this.publishQueue = [];
+    this.uploadPausedUntil = 0;
   }
 
   async initialize() {
     this.logger.info('Initializing Publishing & Scheduling Agent...');
     await this.setupYouTubeAPI();
     await this.loadPublishQueue();
+    const pausedUntil = Number(await this.db.getSetting('youtube_upload_paused_until') || 0);
+    this.uploadPausedUntil = Number.isFinite(pausedUntil) ? pausedUntil : 0;
+    if (this.uploadPausedUntil > Date.now()) this.logger.warn(`YouTube uploads remain paused until ${new Date(this.uploadPausedUntil).toISOString()}`);
     return true;
   }
 
@@ -55,6 +69,25 @@ class PublishingSchedulingAgent {
       }
 
       this.logger.info(`Scheduling content: ${productionData.id}`);
+
+      // Cryptographic Content Deduplication
+      const finalVideoPath = productionData.assets?.finalVideo?.path;
+      const contentHash = productionData.contentHash ||
+        (finalVideoPath && fsSync.existsSync(finalVideoPath) ? computeFileContentHash(finalVideoPath) : null);
+
+      if (contentHash) {
+        const dupCheck = await checkDuplicatePublish({
+          db: this.db,
+          contentHash,
+          platform: 'youtube',
+          productionId: productionData.id
+        });
+        if (dupCheck.isDuplicate) {
+          this.logger.warn(`DUPLICATE DETECTED: Content ${contentHash.slice(0, 12)} already published on YouTube (${dupCheck.record?.youtube_id || dupCheck.record?.platform_post_id}). Skipping new schedule.`);
+          return dupCheck.record;
+        }
+      }
+
       const existing = await this.db.getLatestScheduleEntry?.(productionData.id);
       if (existing) {
         if (['scheduled', 'paused'].includes(existing.status) && !this.publishQueue.some(entry => entry.id === existing.id)) {
@@ -65,23 +98,79 @@ class PublishingSchedulingAgent {
         return existing;
       }
 
+      // Permanent source-level duplicate protection
+      const sourceOriginalPath =
+        productionData.sourceOriginalPath ||
+        productionData.assets?.sourceOriginalPath;
+
+      if (sourceOriginalPath && this.db.getRow) {
+        const sourceExisting = await this.db.getRow(
+          `SELECT q.*
+           FROM publish_schedule q
+           JOIN productions p ON p.id = q.production_id
+           WHERE json_extract(p.assets, '$.sourceOriginalPath') = ?
+             AND q.status IN (
+               'scheduled',
+               'paused',
+               'uploading',
+               'published',
+               'reconciliation_required'
+             )
+           ORDER BY q.created_at DESC
+           LIMIT 1`,
+          [sourceOriginalPath]
+        );
+
+        if (sourceExisting) {
+          const reused = this.db.deserializeScheduleEntry
+            ? this.db.deserializeScheduleEntry(sourceExisting)
+            : sourceExisting;
+
+          if (['scheduled', 'paused'].includes(reused.status) &&
+              !this.publishQueue.some(entry => entry.id === reused.id)) {
+            this.publishQueue.push(reused);
+            this.publishQueue.sort((a, b) =>
+              new Date(a.publishTime) - new Date(b.publishTime)
+            );
+          }
+
+          this.logger.info(
+            `Skipping duplicate source schedule: ${sourceOriginalPath} | existing=${reused.id} | status=${reused.status}`
+          );
+
+          return reused;
+        }
+      }
+
+      // Calculate schedule slot obeying daily target (6/day) if needed
+      let scheduledPublishTime = productionData.scheduledPublishTime;
+      if (!scheduledPublishTime || new Date(scheduledPublishTime).getTime() <= Date.now()) {
+        scheduledPublishTime = await getNextAvailableScheduleSlot({
+          db: this.db,
+          platform: 'youtube'
+        });
+      }
+
       const scheduleEntry = {
         productionId: productionData.id,
         title: productionData.script.title,
-        publishTime: productionData.scheduledPublishTime,
+        publishTime: scheduledPublishTime,
         status: 'scheduled',
         priority: productionData.priority,
+        content_hash: contentHash,
+        idempotency_key: `yt_${contentHash || productionData.id}`,
         metadata: {
           seo: productionData.seo,
           thumbnail: productionData.assets.thumbnail,
           video: productionData.assets.finalVideo,
           audio: productionData.assets.audio,
           captions: productionData.assets.captions,
-          privacyStatus: productionData.privacyStatus || process.env.DEFAULT_PRIVACY_STATUS || 'private',
+          privacyStatus: productionData.privacyStatus || process.env.DEFAULT_PRIVACY_STATUS || 'public',
           containsSyntheticMedia: productionData.containsSyntheticMedia === true,
-          contentType: productionData.contentType || 'long_form',
+          contentType: productionData.contentType || 'short_form',
           sourceProductionId: productionData.sourceProductionId || productionData.id,
-          shortClipId: productionData.shortClipId || null
+          shortClipId: productionData.shortClipId || null,
+          contentHash
         },
         createdAt: new Date().toISOString()
       };
@@ -96,6 +185,37 @@ class PublishingSchedulingAgent {
       this.logger.error('Failed to schedule content:', error);
       throw error;
     }
+  }
+
+  isDeferrable(error, entry) {
+    const msg = String((error && error.message) || error || '');
+    const quota = /quota|exceeded the number of videos|rateLimitExceeded|uploadLimitExceeded/i.test(msg);
+    const net = /socket disconnected|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|fetch failed|TLS connection|oauth2\.googleapis\.com/i.test(msg);
+    const preConn = /oauth2\.googleapis\.com\/token|before secure TLS connection|ENOTFOUND|EAI_AGAIN|ECONNREFUSED/i.test(msg);
+    return quota || preConn || (net && !entry.uploadAttempted);
+  }
+
+  async deferEntry(entry, error) {
+    const msg = String((error && error.message) || error || '');
+    if (/quota|exceeded the number of videos|rateLimitExceeded|uploadLimitExceeded/i.test(msg)) {
+      this.uploadPausedUntil = Date.now() + 6 * 60 * 60 * 1000;
+      await this.db.setSetting('youtube_upload_paused_until', String(this.uploadPausedUntil), 'Persistent YouTube upload-limit pause expiry');
+      this.logger.warn('YouTube upload limit reached; pausing uploads for 6 hours. Videos stay scheduled.');
+      entry.publishTime = new Date(this.uploadPausedUntil + Math.floor(Math.random() * 5 * 60 * 1000)).toISOString();
+    } else {
+      // Exponential backoff with jitter for genuinely transient network/socket errors
+      const attempt = Math.min(Number(entry.retry_count || 0) + 1, 6);
+      const baseMs = Math.min(30 * 60 * 1000, 2000 * Math.pow(2, attempt));
+      const jitterMs = Math.floor(Math.random() * 10000);
+      const delayMs = baseMs + jitterMs;
+      entry.publishTime = new Date(Date.now() + delayMs).toISOString();
+      entry.retry_count = attempt;
+    }
+    entry.status = 'scheduled';
+    entry.error = 'Deferred, will retry: ' + msg.slice(0, 200);
+    await this.db.updateScheduleEntry(entry);
+    try { await this.syncShortStatus(entry, 'scheduled', entry.error); } catch (_e) { /* ignore */ }
+    error.code = 'UPLOAD_DEFERRED';
   }
 
   async publishContent(contentId, options = {}) {
@@ -144,11 +264,64 @@ class PublishingSchedulingAgent {
       if (scheduleEntry.youtubeId) {
         return this.reconcileUploadedVideo(scheduleEntry);
       }
-      if (['uploading', 'reconciliation_required'].includes(scheduleEntry.status)) {
-        const error = new Error('A previous upload may have reached YouTube without returning a video ID. Reconcile the channel before attempting another upload.');
-        error.status = 409;
-        error.code = 'UPLOAD_OUTCOME_UNKNOWN';
-        throw error;
+
+      // Pre-upload cryptographic duplicate prevention
+      const finalVideoPath = scheduleEntry.metadata?.video?.path;
+      const contentHash = scheduleEntry.content_hash ||
+        (finalVideoPath && fsSync.existsSync(finalVideoPath) ? computeFileContentHash(finalVideoPath) : null);
+
+      if (contentHash) {
+        const dupCheck = await checkDuplicatePublish({
+          db: this.db,
+          contentHash,
+          platform: 'youtube',
+          productionId: scheduleEntry.productionId
+        });
+        if (dupCheck.isDuplicate && (dupCheck.record?.youtube_id || dupCheck.record?.platform_post_id)) {
+          const recordedId = dupCheck.record?.youtube_id || dupCheck.record?.platform_post_id;
+          this.logger.warn(`DUPLICATE PREVENTED: Video ${contentHash.slice(0, 12)} is already published on YouTube (${recordedId}). Reconciling without re-upload.`);
+          scheduleEntry.youtubeId = recordedId;
+          scheduleEntry.youtubeUrl = dupCheck.record?.youtube_url || dupCheck.record?.platform_url || `https://www.youtube.com/watch?v=${recordedId}`;
+          scheduleEntry.status = 'published';
+          scheduleEntry.publishedAt = dupCheck.record?.published_at || new Date().toISOString();
+          scheduleEntry.error = null;
+          await this.db.updateScheduleEntry(scheduleEntry);
+          await this.syncShortStatus(scheduleEntry, 'published');
+          this.publishQueue = this.publishQueue.filter(entry => entry.productionId !== scheduleEntry.productionId);
+          return scheduleEntry;
+        }
+      }
+
+      // Hard block: if the entry reached 'reconciliation_required' (a prior
+      // upload outcome is unknown), never attempt a fresh upload.  Re-read
+      // from DB first so we reflect any startup markInterruptedJobs() promotion
+      // even when the in-memory publishQueue still shows the old status.
+      {
+        const liveEntry = this.db.getLatestScheduleEntry
+          ? (await this.db.getLatestScheduleEntry(scheduleEntry.productionId) || scheduleEntry)
+          : scheduleEntry;
+        if (liveEntry.status === 'reconciliation_required') {
+          const error = new Error(
+            'A previous upload may have reached YouTube without returning a video ID. ' +
+            'Reconcile the channel before attempting another upload.'
+          );
+          error.status = 409;
+          error.code = 'UPLOAD_OUTCOME_UNKNOWN';
+          throw error;
+        }
+        // Keep in-memory entry in sync with the live row's status
+        if (liveEntry.status && liveEntry.status !== scheduleEntry.status) {
+          scheduleEntry.status = liveEntry.status;
+        }
+      }
+
+      // Atomic lock claim
+      if (this.db.claimPublishScheduleItem) {
+        const claimed = await this.db.claimPublishScheduleItem(scheduleEntry.id, `yt_worker_${process.pid}`);
+        if (!claimed) {
+          this.logger.info(`Schedule item ${scheduleEntry.id} already claimed by another worker; skipping.`);
+          return scheduleEntry;
+        }
       }
 
       scheduleEntry.status = 'uploading';
@@ -160,7 +333,11 @@ class PublishingSchedulingAgent {
       try {
         uploadResult = await this.uploadToYouTube(scheduleEntry, options);
       } catch (error) {
-        if (scheduleEntry.uploadAttempted && this.isUploadOutcomeUnknown(error)) {
+        if (this.db.releasePublishScheduleItem) {
+          await this.db.releasePublishScheduleItem(scheduleEntry.id, 'scheduled', error.message).catch(() => {});
+        }
+        if (this.isDeferrable(error, scheduleEntry)) { await this.deferEntry(scheduleEntry, error); throw error; }
+      if (scheduleEntry.uploadAttempted && this.isUploadOutcomeUnknown(error)) {
           scheduleEntry.status = 'reconciliation_required';
           scheduleEntry.error = 'Upload outcome is unknown; verify the YouTube channel before retrying';
           await this.db.updateScheduleEntry(scheduleEntry);
@@ -168,7 +345,8 @@ class PublishingSchedulingAgent {
           error.code = 'UPLOAD_OUTCOME_UNKNOWN';
           error.status = 409;
         } else {
-          scheduleEntry.status = 'failed';
+          if (this.isDeferrable(error, scheduleEntry)) { await this.deferEntry(scheduleEntry, error); throw error; }
+        scheduleEntry.status = 'failed';
           scheduleEntry.error = error.message;
           await this.db.updateScheduleEntry(scheduleEntry);
           await this.syncShortStatus(scheduleEntry, 'failed', error.message);
@@ -176,14 +354,26 @@ class PublishingSchedulingAgent {
         throw error;
       }
       
-      // Update database
+      // Update database and registry
       scheduleEntry.status = 'published';
       scheduleEntry.publishedAt = new Date().toISOString();
       scheduleEntry.youtubeId = uploadResult.id;
       scheduleEntry.youtubeUrl = `https://www.youtube.com/watch?v=${uploadResult.id}`;
+      scheduleEntry.error = null;
       
       await this.db.updateScheduleEntry(scheduleEntry);
       await this.syncShortStatus(scheduleEntry, 'published');
+
+      if (contentHash && this.db.savePublishedMediaRegistry) {
+        await this.db.savePublishedMediaRegistry({
+          contentHash,
+          platform: 'youtube',
+          productionId: scheduleEntry.productionId,
+          platformPostId: uploadResult.id,
+          platformUrl: scheduleEntry.youtubeUrl,
+          publishedAt: scheduleEntry.publishedAt
+        }).catch(() => {});
+      }
       
       // Remove from queue
       this.publishQueue = this.publishQueue.filter(entry => entry.productionId !== scheduleEntry.productionId);
@@ -191,7 +381,9 @@ class PublishingSchedulingAgent {
       this.logger.success(`Content published: ${scheduleEntry.youtubeUrl}`);
       return scheduleEntry;
     } catch (error) {
-      this.logger.error('Failed to publish content:', error);
+      this.logger.error(
+        `Failed to publish content: ${error?.message || String(error)} | code=${error?.code || ''} | status=${error?.status || error?.response?.status || ''} | response=${JSON.stringify(error?.response?.data || '')}`
+      );
       throw error;
     }
   }
@@ -205,7 +397,7 @@ class PublishingSchedulingAgent {
     const safeMetadata = validation.value;
     
     // Prepare video metadata
-    const requestedPrivacy = metadata.privacyStatus || process.env.DEFAULT_PRIVACY_STATUS || 'private';
+    const requestedPrivacy = metadata.privacyStatus || process.env.DEFAULT_PRIVACY_STATUS || 'public';
     const scheduledFor = new Date(scheduleEntry.publishTime);
     const futureSchedule = !options.publishNow && Number.isFinite(scheduledFor.getTime()) && scheduledFor.getTime() > Date.now() + 60000;
     const videoMetadata = {
@@ -218,12 +410,12 @@ class PublishingSchedulingAgent {
         defaultAudioLanguage: safeMetadata.defaultAudioLanguage
       },
       status: {
-        privacyStatus: futureSchedule ? 'private' : requestedPrivacy,
+        privacyStatus: requestedPrivacy,
         selfDeclaredMadeForKids: false,
         containsSyntheticMedia: metadata.containsSyntheticMedia === true
       }
     };
-    if (futureSchedule) videoMetadata.status.publishAt = scheduleEntry.publishTime;
+    // Direct public upload: no YouTube publishAt/private staging.
     
     // Resolve the file before marking the network upload as attempted.
     const videoStream = await this.getVideoStream(metadata.video.path);
@@ -416,28 +608,65 @@ class PublishingSchedulingAgent {
   }
 
   async processPublishQueue() {
-    const now = new Date();
-    const scheduled = this.publishQueue
-      .filter(entry => entry.status === 'scheduled')
-      .sort((a, b) => new Date(a.publishTime) - new Date(b.publishTime));
-    const readyToPublish = scheduled.filter(entry => new Date(entry.publishTime) <= now);
-
-    if (readyToPublish.length === 0) {
-      if (scheduled.length > 0) {
-        this.logger.info(`Publish queue: ${scheduled.length} item(s) waiting, next publish at ${scheduled[0].publishTime}`);
-      } else {
-        this.logger.info('Publish queue is empty — nothing scheduled yet.');
-      }
+    if (this.isProcessingQueue) {
+      this.logger.info('Publish queue processing already in flight; skipping overlapping run.');
       return 0;
     }
+    this.isProcessingQueue = true;
+    try {
+      const now = new Date();
+      const scheduled = this.publishQueue
+        .filter(entry => entry.status === 'scheduled')
+        .sort((a, b) => new Date(a.publishTime) - new Date(b.publishTime));
+      const readyToPublish = scheduled.filter(entry => new Date(entry.publishTime) <= now);
+      if (this.uploadPausedUntil && Date.now() < this.uploadPausedUntil) {
+        this.logger.info('Publish queue paused until ' + new Date(this.uploadPausedUntil).toISOString() + ' (YouTube upload limit). ' + readyToPublish.length + ' item(s) waiting.');
+        return 0;
+      }
 
-    this.logger.info(`Processing publish queue: ${readyToPublish.length} item(s) ready to publish...`);
+      if (readyToPublish.length === 0) {
+        if (scheduled.length > 0) {
+          this.logger.info(`Publish queue: ${scheduled.length} item(s) waiting, next publish at ${scheduled[0].publishTime}`);
+        } else {
+          this.logger.info('Publish queue is empty — nothing scheduled yet.');
+        }
+        return 0;
+      }
 
-    for (const entry of readyToPublish) {
-      try {
-        await this.publishContent(entry.productionId);
-        this.logger.info(`Auto-published: ${entry.title}`);
+      // Enforce persistent daily upload limit in audience timezone
+      const tz = await getTimezone(this.db);
+      const todayStr = getLocalDateString(now, tz);
+      const dailyTarget = await getDailyTarget(this.db, 'youtube');
+      let uploadedToday = 0;
+      if (this.db.getAllRows) {
+        const rows = await this.db.getAllRows(
+          `SELECT published_at FROM publish_schedule
+           WHERE status = 'published' AND published_at IS NOT NULL`
+        ).catch(() => []);
+        uploadedToday = (rows || []).filter(r => getLocalDateString(new Date(r.published_at), tz) === todayStr).length;
+      }
+
+      if (uploadedToday >= dailyTarget) {
+        this.logger.info(`Daily YouTube upload limit reached (${uploadedToday}/${dailyTarget} for ${todayStr} [${tz}]). Remaining items stay scheduled.`);
+        return 0;
+      }
+
+      const availableSlots = dailyTarget - uploadedToday;
+      const batch = readyToPublish.slice(0, availableSlots);
+      this.logger.info(`Processing publish queue: ${batch.length} item(s) to publish (Daily quota: ${uploadedToday}/${dailyTarget} in ${tz})...`);
+
+      let publishedCount = 0;
+      for (const entry of batch) {
+        try {
+          await this.publishContent(entry.productionId);
+          this.logger.info(`Auto-published: ${entry.title}`);
+          publishedCount++;
       } catch (error) {
+        if (error.code === 'UPLOAD_DEFERRED') {
+          this.logger.warn('Upload deferred, stays scheduled: ' + entry.title);
+          if (this.uploadPausedUntil && Date.now() < this.uploadPausedUntil) break;
+          continue;
+        }
         if (error.code === 'READINESS_BLOCKED') {
           this.logger.warn(error.message);
           continue;
@@ -451,8 +680,11 @@ class PublishingSchedulingAgent {
         }
       }
     }
-    
-    return readyToPublish.length;
+      
+    return publishedCount;
+  } finally {
+      this.isProcessingQueue = false;
+    }
   }
 
   async getUpcomingSchedule(days = 7) {

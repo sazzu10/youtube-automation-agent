@@ -184,8 +184,34 @@ class SystemTest {
   async testActivationMetrics() {
     const fs = require('fs').promises;
     const { ActivationMetrics } = require('./utils/activation-metrics');
+
+    // Clean up any stale activation test artifacts from prior interrupted runs
+    try {
+      const tempDir = path.join(__dirname, 'temp');
+      const files = await fs.readdir(tempDir).catch(() => []);
+      for (const f of files) {
+        if (f.startsWith('activation_test_') && f.endsWith('.mp4')) {
+          await fs.unlink(path.join(tempDir, f)).catch(() => {});
+        }
+      }
+    } catch (_) {}
+
     const db = new Database();
-    await db.initialize();
+    const withBusyRetry = async (fn, maxRetries = 3) => {
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          return await fn();
+        } catch (err) {
+          if (err?.message?.includes('SQLITE_BUSY') && attempt < maxRetries) {
+            await new Promise(r => setTimeout(r, 400 * attempt));
+            continue;
+          }
+          throw err;
+        }
+      }
+    };
+
+    await withBusyRetry(() => db.initialize());
     const id = `activation_test_${Date.now()}`;
     const videoPath = path.join(__dirname, 'temp', `${id}.mp4`);
     const mp4Header = Buffer.from([
@@ -197,7 +223,7 @@ class SystemTest {
     try {
       await fs.mkdir(path.dirname(videoPath), { recursive: true });
       await fs.writeFile(videoPath, mp4Header);
-      await db.saveProductionData({
+      await withBusyRetry(() => db.saveProductionData({
         id,
         status: 'ready',
         assets: { finalVideo: { path: videoPath, simulated: false } },
@@ -205,7 +231,7 @@ class SystemTest {
         scheduledPublishTime: null,
         priority: 1,
         estimatedDuration: '0:01'
-      });
+      }));
 
       const activation = new ActivationMetrics(db);
       const summary = await activation.getSummary();
@@ -220,22 +246,29 @@ class SystemTest {
       }
 
       await fs.writeFile(videoPath, mp4Header);
-      await db.updateProductionData({
+      await withBusyRetry(() => db.updateProductionData({
         id,
         status: 'simulated',
         assets: { finalVideo: { path: videoPath, simulated: true } },
         timeline: {},
         scheduledPublishTime: null,
         priority: 1
-      });
+      }));
       const simulatedSummary = await activation.getSummary();
       if (simulatedSummary.counts.realVideos >= summary.counts.realVideos) {
         throw new Error('A simulated MP4 was incorrectly counted as activation');
       }
     } finally {
-      await db.executeQuery('DELETE FROM productions WHERE id = ?', [id]);
-      await fs.unlink(videoPath).catch(() => {});
-      await db.close();
+      // Guaranteed unlink FIRST so DB errors never prevent temp file removal
+      try {
+        await fs.unlink(videoPath).catch(() => {});
+      } catch (_) {}
+      try {
+        await db.executeQuery('DELETE FROM productions WHERE id = ?', [id]).catch(() => {});
+      } catch (_) {}
+      try {
+        await db.close().catch(() => {});
+      } catch (_) {}
     }
 
     this.logger.info('Local activation metrics test completed successfully');
@@ -2334,6 +2367,134 @@ class SystemTest {
       throw new Error('Publish now still sent a stale scheduled publishAt value');
     }
 
+    // === Goal A: Metadata validation test with representative videos ===
+    const { resolveYouTubeCategoryId } = require('./utils/shared-metadata-pipeline');
+    const { assertValidYouTubeMetadata } = require('./utils/youtube-metadata-validator');
+
+    // Test dynamic category mapping
+    if (resolveYouTubeCategoryId({ category: 'diy', topic: 'scissor lift table' }) !== '26') {
+      throw new Error('Category mapping failed for DIY metalworking topic');
+    }
+    if (resolveYouTubeCategoryId({ category: 'technology', topic: 'nixie tube display' }) !== '28') {
+      throw new Error('Category mapping failed for Technology topic');
+    }
+    if (resolveYouTubeCategoryId({ category: 'gaming', topic: 'retro arcade' }) !== '20') {
+      throw new Error('Category mapping failed for Gaming topic');
+    }
+
+    // Representative video 1: Craft / DIY Scissor Lift Table
+    const repVideo1 = {
+      title: 'Building a Heavy-Duty Hydraulic Scissor Lift Table: Full Shop Build',
+      description: 'Step-by-step fabrication of a hydraulic scissor lift workshop table from raw steel.\n\nKey chapters:\n0:00 Introduction & Design\n1:15 Frame Fabrication\n3:45 Hydraulic Cylinder Mounting\n5:20 Load Testing & Finish\n\n#diy #welding #metalworking',
+      tags: ['hydraulic scissor lift', 'metal fabrication', 'welding project', 'shop table build', 'workshop tools'],
+      categoryId: resolveYouTubeCategoryId({ category: 'diy', topic: 'scissor lift table' }),
+      defaultLanguage: 'en',
+      defaultAudioLanguage: 'en'
+    };
+    const validRep1 = assertValidYouTubeMetadata(repVideo1);
+    if (!validRep1.valid || validRep1.value.categoryId !== '26') {
+      throw new Error('Representative DIY video metadata failed validation');
+    }
+
+    // Representative video 2: Science & Technology Nixie Clock
+    const repVideo2 = {
+      title: 'Restoring Vintage IN-14 Nixie Tubes for a Custom Desk Clock',
+      description: 'Deep dive into high-voltage driver circuits and restoration of vintage Soviet IN-14 Nixie tubes.\n\n0:00 Tube Testing\n1:20 High Voltage PSU Design\n3:00 Microcontroller Firmware\n\n#electronics #nixietube #vintage',
+      tags: ['nixie tube', 'vintage electronics', 'in14 nixie clock', 'circuit design', 'diy electronics'],
+      categoryId: resolveYouTubeCategoryId({ category: 'technology', topic: 'nixie clock' }),
+      defaultLanguage: 'en',
+      defaultAudioLanguage: 'en'
+    };
+    const validRep2 = assertValidYouTubeMetadata(repVideo2);
+    if (!validRep2.valid || validRep2.value.categoryId !== '28') {
+      throw new Error('Representative Tech video metadata failed validation');
+    }
+
+    // Verify metadata flows into uploadToYouTube videos.insert
+    let passedInsertBody = null;
+    immediate.youtube.videos.insert = async request => {
+      passedInsertBody = request.requestBody;
+      return { data: { id: 'yt-metadata-flow' } };
+    };
+    await immediate.uploadToYouTube({
+      id: 'schedule-rep-flow',
+      publishTime: new Date().toISOString(),
+      metadata: { seo: repVideo1, video: { path: 'fixture.mp4' }, privacyStatus: 'public' }
+    }, { publishNow: true });
+    if (passedInsertBody?.snippet?.categoryId !== '26' || passedInsertBody?.snippet?.title !== repVideo1.title) {
+      throw new Error('Upload code did not preserve dynamic category ID or title in videos.insert snippet');
+    }
+
+    // === Goal B: 6 distinct US Pacific schedule slots & daily cap ===
+    const { getNextAvailableScheduleSlot, getLocalDateString } = require('./utils/schedule-calculator');
+    const mockDb = {
+      all: async () => [],
+      get: async () => null,
+      getRow: async () => null,
+      allRows: async () => []
+    };
+    const pacificToday = getLocalDateString(new Date(), 'America/Los_Angeles');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(pacificToday)) {
+      throw new Error('getLocalDateString failed to return valid YYYY-MM-DD for America/Los_Angeles');
+    }
+
+    // Generate 6 distinct schedule slots
+    const generatedSlots = [];
+    let currentSchedule = [];
+    for (let i = 0; i < 6; i++) {
+      const slot = await getNextAvailableScheduleSlot({
+        db: mockDb,
+        platform: 'youtube',
+        targetDate: pacificToday,
+        existingPosts: currentSchedule,
+        timezone: 'America/Los_Angeles'
+      });
+      generatedSlots.push(slot);
+      currentSchedule.push({ publishTime: slot });
+    }
+    const uniqueSlots = new Set(generatedSlots);
+    if (uniqueSlots.size !== 6) {
+      throw new Error('Did not generate 6 distinct schedule slots for US Pacific audience windows');
+    }
+
+    // Single-flight queue processing lock test
+    const lockAgent = new PublishingSchedulingAgent({
+      getAllScheduleEntries: async () => [],
+      updateScheduleEntry: async () => {}
+    }, {});
+    lockAgent.isProcessingQueue = true;
+    const lockedRun = await lockAgent.processPublishQueue();
+    if (lockedRun !== 0) {
+      throw new Error('Single-flight queue processing lock did not prevent concurrent queue run');
+    }
+
+    // Daily cap enforcement test (cap at 6)
+    const cappedAgent = new PublishingSchedulingAgent({
+      getAllRows: async (sql) => {
+        if (sql.includes('published_at')) {
+          return [
+            { published_at: new Date().toISOString() },
+            { published_at: new Date().toISOString() },
+            { published_at: new Date().toISOString() },
+            { published_at: new Date().toISOString() },
+            { published_at: new Date().toISOString() },
+            { published_at: new Date().toISOString() }
+          ];
+        }
+        return [];
+      },
+      updateScheduleEntry: async () => {}
+    }, {});
+    cappedAgent.publishQueue = [
+      { id: 'due-1', status: 'scheduled', publishTime: new Date(Date.now() - 1000).toISOString(), metadata: { audio: intentionalAudio } }
+    ];
+    let publishAttemptedOnCapped = false;
+    cappedAgent.publishContent = async () => { publishAttemptedOnCapped = true; };
+    const capResult = await cappedAgent.processPublishQueue();
+    if (capResult !== 0 || publishAttemptedOnCapped) {
+      throw new Error('Daily upload cap of 6 was not enforced when 6 uploads already completed today');
+    }
+
     this.logger.info('Publishing safety test completed successfully');
   }
 
@@ -2665,12 +2826,12 @@ class SystemTest {
       if (embeddedAssets.length !== stills.length || embeddedAssets.some(asset => !asset.startsWith('data:image/png;base64,'))) {
         throw new Error('Slideshow image assets were not embedded as browser-safe image data');
       }
-      const { chromium } = require('playwright');
       let browser = null;
       try {
+        const { chromium } = require('playwright');
         browser = await chromium.launch();
       } catch (error) {
-        if (!/Executable doesn't exist|playwright install/i.test(error.message)) throw error;
+        if (!/Executable doesn't exist|playwright install|unsupported platform/i.test(error.message)) throw error;
         this.logger.warn('Chromium is not installed — verified browser-safe image embedding without the live browser assertion');
       }
       if (browser) {
@@ -3383,14 +3544,18 @@ class SystemTest {
   }
 
   async testEngagementAIProviderWiring() {
-    const { AITextService } = require('./utils/ai-text-service');
+    const { AITextService, PROVIDERS } = require('./utils/ai-text-service');
 
     // Regression: index.js must hand AITextService the unwrapped credentials object
     // (manager.credentials), the shape the walkthrough writes to credentials.json.
     // Passing the CredentialManager itself leaves the engagement studio permanently
     // in fallback mode on installs with no provider environment variables.
-    const savedEnv = process.env.OPENAI_API_KEY;
-    delete process.env.OPENAI_API_KEY;
+    const envKeys = [...Object.values(PROVIDERS).map(p => p.envKey), 'GEMINI_API_KEY'];
+    const savedEnv = {};
+    for (const key of envKeys) {
+      savedEnv[key] = process.env[key];
+      delete process.env[key];
+    }
     try {
       const configured = new AITextService({
         aiProvider: { provider: 'openai', apiKey: 'test-key', model: 'gpt-5.6' }
@@ -3402,12 +3567,16 @@ class SystemTest {
       const wrapped = new AITextService({
         credentials: { aiProvider: { provider: 'openai', apiKey: 'test-key', model: 'gpt-5.6' } }
       });
+      wrapped.gemini = null;
+      wrapped.keyRotator.keys = [];
       if (wrapped.isAvailable()) {
         throw new Error('A CredentialManager-shaped argument must not look configured; index.js has to unwrap it');
       }
     } finally {
-      if (savedEnv === undefined) delete process.env.OPENAI_API_KEY;
-      else process.env.OPENAI_API_KEY = savedEnv;
+      for (const key of envKeys) {
+        if (savedEnv[key] === undefined) delete process.env[key];
+        else process.env[key] = savedEnv[key];
+      }
     }
   }
 
@@ -3468,10 +3637,41 @@ class SystemTest {
 
 // Run tests if called directly
 if (require.main === module) {
+  const fsSync = require('fs');
+  const lockFile = path.join(__dirname, 'temp', 'systemtest.lock');
+  try {
+    fsSync.mkdirSync(path.join(__dirname, 'temp'), { recursive: true });
+    if (fsSync.existsSync(lockFile)) {
+      const lockPid = parseInt(fsSync.readFileSync(lockFile, 'utf8'), 10);
+      if (lockPid && !isNaN(lockPid)) {
+        try {
+          process.kill(lockPid, 0);
+          console.log(chalk.yellow(`\n⚠️  SystemTest is already running (PID ${lockPid}). Exiting to prevent duplicate test load.`));
+          process.exit(0);
+        } catch (_) {}
+      }
+    }
+    fsSync.writeFileSync(lockFile, String(process.pid));
+  } catch (_) {}
+
+  const cleanupLock = () => {
+    try {
+      if (fsSync.existsSync(lockFile)) fsSync.unlinkSync(lockFile);
+    } catch (_) {}
+  };
+
+  process.on('exit', cleanupLock);
+  process.on('SIGINT', () => { cleanupLock(); process.exit(130); });
+  process.on('SIGTERM', () => { cleanupLock(); process.exit(143); });
+
   const tester = new SystemTest();
   tester.runAllTests()
-    .then(success => process.exit(success ? 0 : 1))
+    .then(success => {
+      cleanupLock();
+      process.exit(success ? 0 : 1);
+    })
     .catch(error => {
+      cleanupLock();
       console.error(chalk.red('Test runner failed:'), error);
       process.exit(1);
     });
