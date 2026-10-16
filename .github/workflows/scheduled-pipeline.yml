@@ -12,11 +12,19 @@ on:
     - cron: '0 14,17,20,23,2,4 * * *'
   workflow_dispatch:
     inputs:
+      mode:
+        description: 'Execution mode: dry-run (simulation) or live (upload to YouTube)'
+        required: true
+        type: choice
+        default: 'dry-run'
+        options:
+          - 'dry-run'
+          - 'live'
       dry_run:
-        description: 'Dry run mode (validate pipeline without live publishing)'
+        description: 'Run in dry-run mode (set to false to enable live publishing)'
         required: false
         type: boolean
-        default: false
+        default: true
 
 concurrency:
   group: youtube-shorts-pipeline
@@ -71,5 +79,10 @@ jobs:
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
           YOUTUBE_CREDENTIALS_JSON: ${{ secrets.YOUTUBE_CREDENTIALS_JSON }}
           YOUTUBE_TOKENS_JSON: ${{ secrets.YOUTUBE_TOKENS_JSON }}
-          DRY_RUN: ${{ inputs.dry_run || false }}
+          SCHEDULED_LIVE_ENABLED: ${{ secrets.SCHEDULED_LIVE_ENABLED }}
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          EVENT_NAME: ${{ github.event_name }}
+          DRY_RUN: ${{ (inputs.mode == 'live' || (github.event_name == 'schedule' && secrets.SCHEDULED_LIVE_ENABLED == 'true')) && 'false' || 'true' }}
+          PIPELINE_MODE: ${{ (inputs.mode == 'live' || (github.event_name == 'schedule' && secrets.SCHEDULED_LIVE_ENABLED == 'true')) && 'live' || 'dry-run' }}
         run: npm run pipeline:cycle

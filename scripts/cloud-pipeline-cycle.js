@@ -24,16 +24,54 @@ const { Logger } = require('../utils/logger');
 
 const logger = new Logger('CloudPipeline');
 
-async function runCloudPipelineCycle() {
-  const isDryRun = process.env.DRY_RUN === 'true';
-  logger.info(`=== Starting Cloud Pipeline Cycle (Dry Run: ${isDryRun}) ===`);
+function resolvePipelineMode() {
+  const eventName = (process.env.EVENT_NAME || process.env.GITHUB_EVENT_NAME || '').trim().toLowerCase();
+  const inputMode = (process.env.INPUT_MODE || '').trim().toLowerCase();
+  const inputDryRun = (process.env.INPUT_DRY_RUN || '').trim().toLowerCase();
+  const scheduledLive = (process.env.SCHEDULED_LIVE_ENABLED || '').trim().toLowerCase() === 'true';
+  const envDryRun = (process.env.DRY_RUN || '').trim().toLowerCase();
+  const envMode = (process.env.PIPELINE_MODE || '').trim().toLowerCase();
+
+  // Explicit env overrides (highest precedence)
+  if (envMode === 'live' || envDryRun === 'false') {
+    return { isDryRun: false, mode: 'live' };
+  }
+  if (envMode === 'dry-run' || envDryRun === 'true') {
+    return { isDryRun: true, mode: 'dry-run' };
+  }
+
+  // Workflow dispatch trigger: check user inputs
+  if (eventName === 'workflow_dispatch') {
+    if (inputMode === 'live' || (inputMode !== 'dry-run' && inputDryRun === 'false')) {
+      return { isDryRun: false, mode: 'live' };
+    }
+    return { isDryRun: true, mode: 'dry-run' };
+  }
+
+  // Scheduled cron trigger: requires explicit opt-in via SCHEDULED_LIVE_ENABLED secret
+  if (eventName === 'schedule') {
+    if (scheduledLive) {
+      return { isDryRun: false, mode: 'live' };
+    }
+    return { isDryRun: true, mode: 'dry-run' };
+  }
+
+  // Safe default: dry-run
+  return { isDryRun: true, mode: 'dry-run' };
+}
+
+async function runCloudPipelineCycle(options = {}) {
+  const resolved = resolvePipelineMode();
+  const isDryRun = typeof options.isDryRun === 'boolean' ? options.isDryRun : resolved.isDryRun;
+  const mode = options.mode || (isDryRun ? 'dry-run' : 'live');
+  logger.info(`=== Starting Cloud Pipeline Cycle (Mode: ${mode.toUpperCase()} | Dry Run: ${isDryRun}) ===`);
 
   // 1. Initialize Database
-  const db = new Database();
+  const db = options.db || new Database();
   await db.initialize();
 
   // 2. Initialize Credentials
-  const credentials = new CredentialManager();
+  const credentials = options.credentials || new CredentialManager();
   await credentials.initialize();
 
   // 3. Timezone and Quota settings
@@ -50,13 +88,18 @@ async function runCloudPipelineCycle() {
 
   logger.info(`AI Provider Available: ${hasAIText} | YouTube API Configured: ${hasYouTube}`);
 
-  if (!hasAIText && !isDryRun) {
-    logger.warn('No AI Provider configured. Cloud run requires GEMINI_API_KEY, OPENROUTER_API_KEY, or OPENAI_API_KEY in GitHub Secrets.');
-    return { status: 'SKIPPED', reason: 'NO_AI_PROVIDER' };
+  if (!isDryRun && !hasAIText) {
+    logger.error('FAIL-CLOSED: Live mode requires an AI Provider (GEMINI_API_KEY, OPENROUTER_API_KEY, or OPENAI_API_KEY). Missing in GitHub Secrets.');
+    return { status: 'FAILED', reason: 'NO_AI_PROVIDER' };
+  }
+
+  if (!isDryRun && !hasYouTube) {
+    logger.error('FAIL-CLOSED: Live mode requires valid YouTube OAuth credentials (YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET, YOUTUBE_REFRESH_TOKEN). Missing in GitHub Secrets.');
+    return { status: 'FAILED', reason: 'MISSING_YOUTUBE_CREDENTIALS' };
   }
 
   // 5. Initialize Agents
-  const agents = {
+  const agents = options.agents || {
     strategy: new ContentStrategyAgent(db, credentials),
     scriptWriter: new ScriptWriterAgent(db, credentials),
     thumbnailDesigner: new ThumbnailDesignerAgent(db, credentials),
@@ -71,7 +114,18 @@ async function runCloudPipelineCycle() {
     });
   }
 
-  if (agents.publishing) {
+  if (!isDryRun) {
+    if (!agents.publishing) {
+      logger.error('FAIL-CLOSED: Publishing agent could not be instantiated in live mode.');
+      return { status: 'FAILED', reason: 'PUBLISHING_AGENT_UNAVAILABLE' };
+    }
+    try {
+      await agents.publishing.initialize();
+    } catch (err) {
+      logger.error(`FAIL-CLOSED: Publishing agent initialization failed: ${err.message}`);
+      return { status: 'FAILED', reason: 'PUBLISHING_INITIALIZE_FAILED', error: err.message };
+    }
+  } else if (agents.publishing) {
     await agents.publishing.initialize().catch(err => {
       logger.warn(`Publishing agent initialization warning: ${err.message}`);
     });
@@ -89,7 +143,7 @@ async function runCloudPipelineCycle() {
 
   logger.info(`Progress today: ${uploadedToday}/${dailyTarget} published on ${todayStr} [${tz}]`);
 
-  if (uploadedToday >= dailyTarget) {
+  if (uploadedToday >= dailyTarget && !isDryRun) {
     logger.info(`Daily upload limit reached (${uploadedToday}/${dailyTarget}). No additional videos will be uploaded today.`);
     return { status: 'COMPLETED', uploadedToday, dailyTarget, reason: 'DAILY_CAP_REACHED' };
   }
@@ -107,7 +161,7 @@ async function runCloudPipelineCycle() {
 
   // Check again after publishing
   const remainingSlots = dailyTarget - (uploadedToday + publishedCount);
-  if (remainingSlots <= 0) {
+  if (remainingSlots <= 0 && !isDryRun) {
     logger.info(`Daily quota fulfilled (${uploadedToday + publishedCount}/${dailyTarget}).`);
     return { status: 'COMPLETED', publishedCount, remainingSlots: 0 };
   }
@@ -150,24 +204,39 @@ async function runCloudPipelineCycle() {
     });
     logger.info(`Production complete: ${production.id}`);
 
-    // Schedule content
-    if (agents.publishing) {
-      const scheduleEntry = await agents.publishing.scheduleContent(production);
-      if (scheduleEntry) {
-        logger.info(`Content scheduled for: ${scheduleEntry.publishTime}`);
-
-        // If the scheduled time is due right now (or within 5 minutes), attempt upload
-        const scheduleTime = new Date(scheduleEntry.publishTime).getTime();
-        if (scheduleTime <= Date.now() + 5 * 60 * 1000) {
-          logger.info('Scheduled slot is due now; dispatching to YouTube...');
-          await agents.publishing.processPublishQueue();
-        }
-      }
+    // Schedule content and immediately publish to YouTube in live cloud cycle
+    if (!agents.publishing) {
+      throw new Error('Publishing agent unavailable during live execution.');
     }
 
-    return { status: 'COMPLETED', publishedCount, generated: 1 };
+    const scheduleEntry = await agents.publishing.scheduleContent(production);
+    if (!scheduleEntry) {
+      throw new Error(`Failed to schedule production ${production.id} for publishing.`);
+    }
+
+    logger.info(`Content scheduled: ${scheduleEntry.id} (slot: ${scheduleEntry.publishTime})`);
+    logger.info(`Live mode: dispatching upload to YouTube for production ${production.id}...`);
+
+    const publishedResult = await agents.publishing.publishContent(scheduleEntry.productionId, { publishNow: true });
+
+    if (!publishedResult || publishedResult.status !== 'published' || !publishedResult.youtubeId) {
+      throw new Error(
+        `YouTube upload failed: expected status 'published' and valid videoId, got status='${publishedResult?.status}', id='${publishedResult?.youtubeId}', error='${publishedResult?.error}'`
+      );
+    }
+
+    publishedCount++;
+    logger.info(`Successfully uploaded to YouTube: ${publishedResult.youtubeUrl || publishedResult.youtubeId}`);
+
+    return {
+      status: 'COMPLETED',
+      publishedCount,
+      generated: 1,
+      videoId: publishedResult.youtubeId,
+      videoUrl: publishedResult.youtubeUrl
+    };
   } catch (genError) {
-    logger.error(`Generation cycle encountered an error: ${genError.message}`);
+    logger.error(`Generation/publishing cycle encountered an error: ${genError.message}`);
     return { status: 'FAILED', error: genError.message };
   }
 }
@@ -184,4 +253,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { runCloudPipelineCycle };
+module.exports = { runCloudPipelineCycle, resolvePipelineMode };
