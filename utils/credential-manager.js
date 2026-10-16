@@ -197,10 +197,14 @@ class CredentialManager {
       throw new Error('YouTube credentials not configured');
     }
 
+    const redirectUri = Array.isArray(this.credentials.youtube.redirect_uris) && this.credentials.youtube.redirect_uris.length
+      ? this.credentials.youtube.redirect_uris[0]
+      : (process.env.YOUTUBE_REDIRECT_URI || 'http://localhost:8080/oauth2callback');
+
     const oauth2Client = new google.auth.OAuth2(
       this.credentials.youtube.client_id,
       this.credentials.youtube.client_secret,
-      this.credentials.youtube.redirect_uris[0]
+      redirectUri
     );
 
     oauth2Client.setCredentials(this.tokens.youtube);

@@ -135,6 +135,7 @@ class ProductionManagementAgent {
 
   async processScript(script) {
     const scriptPath = path.join(__dirname, '..', 'data', 'scripts', `${Date.now()}_script.json`);
+    await fs.mkdir(path.dirname(scriptPath), { recursive: true });
     
     // Create formatted script for TTS
     const ttsScript = this.formatScriptForTTS(script);
@@ -145,12 +146,17 @@ class ProductionManagementAgent {
       scriptPath.replace('.json', '_tts.txt'), 
       ttsScript
     );
+
+    const stats = await fs.stat(scriptPath);
+    if (!stats.isFile() || stats.size === 0) {
+      throw new Error(`Failed to write script file: ${scriptPath} is missing or empty`);
+    }
     
     return {
       originalPath: scriptPath,
       ttsPath: scriptPath.replace('.json', '_tts.txt'),
       duration: script.duration,
-      sections: script.mainContent.sections.length
+      sections: script.mainContent?.sections?.length || 0
     };
   }
 
@@ -239,6 +245,7 @@ class ProductionManagementAgent {
         __dirname, '..', 'data', 'assets', 
         `thumbnail_${Date.now()}.jpg`
       );
+      await fs.mkdir(path.dirname(productionThumbnailPath), { recursive: true });
       
       if (thumbnail.path && await fs.access(thumbnail.path).then(() => true).catch(() => false)) {
         const originalBuffer = await fs.readFile(thumbnail.path);
@@ -422,6 +429,7 @@ class ProductionManagementAgent {
     
     try {
       const audioPath = path.join(__dirname, '..', 'data', 'audio', `${productionData.id}_narration.mp3`);
+      await fs.mkdir(path.dirname(audioPath), { recursive: true });
       
       // Read the TTS script
       const ttsText = await fs.readFile(productionData.assets.script.ttsPath, 'utf8');
@@ -570,6 +578,7 @@ class ProductionManagementAgent {
     
     try {
       const finalVideoPath = path.join(__dirname, '..', 'data', 'videos', `${productionData.id}_final.mp4`);
+      await fs.mkdir(path.dirname(finalVideoPath), { recursive: true });
       const narrationReady = await this.aiVideoGenerator.isUsableAudioFile(productionData.assets.audio?.path);
       if (!narrationReady && productionData.assets.audio?.intentionalSilence !== true) {
         this.logger.warn('Final assembly is blocked until narration succeeds or the operator explicitly confirms an intentional silent video.');
@@ -683,6 +692,7 @@ class ProductionManagementAgent {
   // Fallback simulation methods
   async simulateAudioGeneration(productionData, failure = null) {
     const audioPath = path.join(__dirname, '..', 'data', 'audio', `${productionData.id}_narration.mp3`);
+    await fs.mkdir(path.dirname(audioPath), { recursive: true });
     
     await fs.writeFile(audioPath + '.info', JSON.stringify({
       message: 'AI TTS audio would be generated here',
@@ -709,6 +719,7 @@ class ProductionManagementAgent {
 
   async simulateVideoAssembly(productionData, reason = null) {
     const finalVideoPath = path.join(__dirname, '..', 'data', 'videos', `${productionData.id}_final.mp4`);
+    await fs.mkdir(path.dirname(finalVideoPath), { recursive: true });
     
     const assemblyInstructions = {
       message: 'AI video would be assembled here',

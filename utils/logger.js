@@ -79,12 +79,24 @@ class Logger {
     }
   }
 
+  maskSecrets(str) {
+    if (typeof str !== 'string') return str;
+    return str
+      .replace(/AIza[0-9A-Za-z-_]{35}/g, 'AIza...[REDACTED]')
+      .replace(/sk-[a-zA-Z0-9_-]{20,}/g, 'sk-...[REDACTED]')
+      .replace(/ya29\.[a-zA-Z0-9_.-]+/g, 'ya29...[REDACTED]')
+      .replace(/1\/\/[a-zA-Z0-9_.-]+/g, '1//...[REDACTED]')
+      .replace(/(Bearer\s+)[A-Za-z0-9._~+/-]+/gi, '$1[REDACTED]')
+      .replace(/("?(?:client_secret|refresh_token|api_key|apiKey)"?\s*[:=]\s*"?[^",\s]+"?)/gi, '[CREDENTIAL_MASKED]');
+  }
+
   formatConsoleMessage(level, message, colorFunc) {
     const timestamp = new Date().toLocaleTimeString();
     const componentTag = chalk.cyan(`[${this.component}]`);
     const levelTag = colorFunc(`[${level}]`);
+    const sanitized = this.maskSecrets(String(message ?? ''));
     
-    return `${chalk.gray(timestamp)} ${componentTag} ${levelTag} ${message}`;
+    return `${chalk.gray(timestamp)} ${componentTag} ${levelTag} ${sanitized}`;
   }
 
   // Method to create specialized loggers for different purposes

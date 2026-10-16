@@ -420,15 +420,25 @@ class PublishingSchedulingAgent {
     // Resolve the file before marking the network upload as attempted.
     const videoStream = await this.getVideoStream(metadata.video.path);
     scheduleEntry.uploadAttempted = true;
-    const videoUpload = await this.youtube.videos.insert({
-      part: 'snippet,status',
-      requestBody: videoMetadata,
-      media: {
-        body: videoStream
+    let videoUpload;
+    try {
+      videoUpload = await this.youtube.videos.insert({
+        part: 'snippet,status',
+        requestBody: videoMetadata,
+        media: {
+          body: videoStream
+        }
+      });
+    } finally {
+      if (videoStream && typeof videoStream.destroy === 'function') {
+        videoStream.destroy();
       }
-    });
+    }
     
-    const videoId = videoUpload.data.id;
+    const videoId = videoUpload?.data?.id;
+    if (!videoId) {
+      throw new Error('YouTube videos.insert succeeded but returned no valid video ID in response');
+    }
     this.logger.info(`Video uploaded with ID: ${videoId}`);
     scheduleEntry.status = 'uploaded';
     scheduleEntry.youtubeId = videoId;
@@ -488,6 +498,38 @@ class PublishingSchedulingAgent {
     this.publishQueue = this.publishQueue.filter(entry => entry.productionId !== scheduleEntry.productionId);
     this.logger.success(`Reconciled existing YouTube upload: ${scheduleEntry.youtubeUrl}`);
     return scheduleEntry;
+  }
+
+  async getChannelUploadsCountToday(timezone = 'America/Los_Angeles') {
+    if (!this.youtube) return null;
+    try {
+      const channelRes = await this.youtube.channels.list({
+        part: 'contentDetails',
+        mine: true
+      });
+      const uploadsPlaylistId = channelRes.data.items?.[0]?.contentDetails?.relatedPlaylists?.uploads;
+      if (!uploadsPlaylistId) return null;
+
+      const playlistRes = await this.youtube.playlistItems.list({
+        part: 'snippet',
+        playlistId: uploadsPlaylistId,
+        maxResults: 15
+      });
+
+      const todayStr = getLocalDateString(new Date(), timezone);
+      const items = playlistRes.data.items || [];
+      const uploadsToday = items.filter(item => {
+        const publishedAt = item.snippet?.publishedAt;
+        if (!publishedAt) return false;
+        return getLocalDateString(new Date(publishedAt), timezone) === todayStr;
+      });
+
+      this.logger.info(`YouTube Channel API check: ${uploadsToday.length} video(s) uploaded today (${todayStr} [${timezone}])`);
+      return { count: uploadsToday.length, items: uploadsToday };
+    } catch (err) {
+      this.logger.warn(`Could not fetch channel uploads from YouTube API: ${err.message}`);
+      return null;
+    }
   }
 
   async syncShortStatus(scheduleEntry, status, error = null) {

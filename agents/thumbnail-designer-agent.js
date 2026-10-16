@@ -224,11 +224,18 @@ class ThumbnailDesignerAgent {
       </svg>
     `;
     
+    await fs.mkdir(path.dirname(outputPath), { recursive: true });
+    
     await sharp(Buffer.from(svg))
       .resize(width, height)
       .png()
       .toFile(outputPath);
     
+    const stats = await fs.stat(outputPath);
+    if (!stats.isFile() || stats.size === 0) {
+      throw new Error(`Failed to generate thumbnail: output file ${outputPath} is missing or empty`);
+    }
+
     return outputPath;
   }
 
@@ -291,6 +298,8 @@ class ThumbnailDesignerAgent {
     
     const textOverlay = await sharp(Buffer.from(textSvg)).png().toBuffer();
     
+    await fs.mkdir(path.dirname(outputPath), { recursive: true });
+
     await sharp(imagePath)
       .composite([{
         input: textOverlay,
@@ -299,13 +308,19 @@ class ThumbnailDesignerAgent {
       }])
       .toFile(outputPath);
     
+    const overlayStats = await fs.stat(outputPath);
+    if (!overlayStats.isFile() || overlayStats.size === 0) {
+      throw new Error(`Failed to generate text overlay thumbnail: ${outputPath} is missing or empty`);
+    }
+
     return outputPath;
   }
 
   async optimizeForYouTube(imagePath, suffix = '') {
     const marker = suffix ? `_${suffix}` : '';
     const outputPath = path.join(__dirname, '..', 'uploads', 'thumbnails', `thumbnail_optimized${marker}_${Date.now()}.jpg`);
-    
+    await fs.mkdir(path.dirname(outputPath), { recursive: true });
+
     // YouTube optimization: JPEG format, proper compression
     await sharp(imagePath)
       .resize(1280, 720, {
@@ -329,6 +344,11 @@ class ThumbnailDesignerAgent {
         .toFile(outputPath);
     }
     
+    const finalStats = await fs.stat(outputPath);
+    if (!finalStats.isFile() || finalStats.size === 0) {
+      throw new Error(`Failed to optimize thumbnail: ${outputPath} is missing or empty`);
+    }
+
     return outputPath;
   }
 

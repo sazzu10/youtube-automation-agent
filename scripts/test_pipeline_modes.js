@@ -140,7 +140,10 @@ async function testPipelineModes() {
   const mockDb = {
     initialize: async () => true,
     getAllRows: async () => [],
-    getSetting: async () => null
+    getSetting: async () => null,
+    updateScheduleEntry: async (entry) => entry,
+    saveScheduleEntry: async (entry) => entry,
+    getLatestScheduleEntry: async () => null
   };
 
   let publishContentCalledWith = null;
@@ -214,9 +217,130 @@ async function testPipelineModes() {
   assert.strictEqual(liveFailResult.status, 'FAILED');
   assert(liveFailResult.error.includes('Simulated YouTube API Upload Failure'));
 
+  console.log('\nTest 14: Ephemeral clean runner directory creation verifies all required directories exist');
+  const fs = require('fs').promises;
+  const path = require('path');
+  const checkDirs = [
+    'uploads',
+    'uploads/thumbnails',
+    'uploads/videos',
+    'data',
+    'data/production',
+    'data/assets',
+    'data/videos',
+    'data/audio',
+    'data/scripts',
+    'data/captions',
+    'temp/processing',
+    'logs'
+  ];
+  for (const d of checkDirs) {
+    const fullPath = path.resolve(process.cwd(), d);
+    const stat = await fs.stat(fullPath).catch(() => null);
+    assert(stat && stat.isDirectory(), `Directory ${d} must exist after pipeline run`);
+  }
+
+  console.log('\nTest 15: AI script parser robustness with malformed / markdown JSON and template fallback');
+  const { ScriptWriterAgent } = require('../agents/script-writer-agent');
+  const dummyScriptWriter = new ScriptWriterAgent(mockDb, mockCredsValid);
+
+  // Case 15a: Markdown code fence extraction
+  const jsonWithFence = '```json\n{"title": "Markdown Title", "hook": "Look at this", "scenes": [{"text": "Hello"}]}\n```';
+  const parsedFence = dummyScriptWriter.parseAIJsonResponse(jsonWithFence, { topic: 'Test' });
+  assert.strictEqual(parsedFence.title, 'Markdown Title');
+
+  // Case 15b: Malformed text fallback
+  const malformedText = 'I cannot generate JSON right now, sorry!';
+  const parsedFallback = dummyScriptWriter.parseAIJsonResponse(malformedText, { topic: 'Fallback Topic' });
+  assert(parsedFallback.title && parsedFallback.title.length > 0, 'Must produce a valid title from fallback');
+  assert(Array.isArray(parsedFallback.scenes) && parsedFallback.scenes.length > 0, 'Must produce fallback scenes');
+  assert(parsedFallback.narration && parsedFallback.narration.length > 0, 'Must produce fallback narration');
+
+  console.log('\nTest 16: YouTube upload fails closed if API returns no valid video ID');
+  const { PublishingSchedulingAgent } = require('../agents/publishing-scheduling-agent');
+  const publishingAgent = new PublishingSchedulingAgent(mockDb, mockCredsValid);
+  publishingAgent.youtube = {
+    videos: {
+      insert: async () => ({ data: { /* Missing id */ } })
+    }
+  };
+  // Mock dummy MP4 file for getVideoStream
+  const testMp4Path = path.resolve(process.cwd(), 'temp/test_sample_video.mp4');
+  await fs.writeFile(testMp4Path, Buffer.from('fake_mp4_bytes_for_test'));
+
+  const dummyScheduleEntry = {
+    id: 'test_sched_no_id',
+    metadata: {
+      seo: { title: 'Test Video', description: 'Test Desc', tags: ['shorts'] },
+      video: { path: testMp4Path }
+    }
+  };
+
+  let noIdThrew = false;
+  try {
+    await publishingAgent.uploadToYouTube(dummyScheduleEntry, { publishNow: true });
+  } catch (err) {
+    noIdThrew = true;
+    assert(err.message.includes('returned no valid video ID'), `Expected no valid video ID error, got: ${err.message}`);
+  }
+  assert.strictEqual(noIdThrew, true, 'Must fail closed when video ID is missing from response');
+
+  console.log('\nTest 17: Upload uncertain outcome sets status to reconciliation_required and throws UPLOAD_OUTCOME_UNKNOWN');
+  publishingAgent.youtube.videos.insert = async () => {
+    const err = new Error('500 Internal Server Error from YouTube');
+    err.status = 500;
+    throw err;
+  };
+
+  dummyScheduleEntry.productionId = 'prod_test_uncertain';
+  dummyScheduleEntry.metadata.audio = { path: testMp4Path };
+  publishingAgent.publishQueue = [dummyScheduleEntry];
+
+  let uncertainThrew = false;
+  try {
+    await publishingAgent.publishContent('prod_test_uncertain');
+  } catch (err) {
+    uncertainThrew = true;
+    assert.strictEqual(err.code, 'UPLOAD_OUTCOME_UNKNOWN', 'Error code must be UPLOAD_OUTCOME_UNKNOWN');
+    assert.strictEqual(dummyScheduleEntry.status, 'reconciliation_required', 'Schedule entry must be marked reconciliation_required');
+  }
+  assert.strictEqual(uncertainThrew, true, 'Must throw UPLOAD_OUTCOME_UNKNOWN on uncertain 500 response');
+
+  console.log('\nTest 18: Live mode quota reconciliation halts cycle when channel has 6 uploads today');
+  resetEnv();
+  process.env.DRY_RUN = 'false';
+  process.env.PIPELINE_MODE = 'live';
+
+  const mockPublishingWith6Uploads = {
+    initialize: async () => true,
+    getChannelUploadsCountToday: async () => ({ count: 6, items: [1,2,3,4,5,6] }),
+    processPublishQueue: async () => 0,
+    scheduleContent: async () => null,
+    publishContent: async () => null
+  };
+
+  const quotaResult = await runCloudPipelineCycle({
+    credentials: mockCredsValid,
+    db: {
+      initialize: async () => true,
+      getAllRows: async () => [] // Local DB is empty (simulating clean runner with evicted cache)
+    },
+    agents: {
+      ...mockAgentsSuccess,
+      publishing: mockPublishingWith6Uploads
+    }
+  });
+
+  assert.strictEqual(quotaResult.status, 'COMPLETED');
+  assert.strictEqual(quotaResult.reason, 'DAILY_CAP_REACHED');
+  assert.strictEqual(quotaResult.uploadedToday, 6);
+
+  // Clean up test file
+  await fs.unlink(testMp4Path).catch(() => {});
+
   // Restore env
   resetEnv();
-  console.log('\n✅ ALL 13 TESTS PASSED SUCCESSFULLY!');
+  console.log('\n✅ ALL 18 TESTS PASSED SUCCESSFULLY!');
 }
 
 if (require.main === module) {
@@ -229,3 +353,4 @@ if (require.main === module) {
 }
 
 module.exports = { testPipelineModes };
+

@@ -66,15 +66,37 @@ async function runCloudPipelineCycle(options = {}) {
   const mode = options.mode || (isDryRun ? 'dry-run' : 'live');
   logger.info(`=== Starting Cloud Pipeline Cycle (Mode: ${mode.toUpperCase()} | Dry Run: ${isDryRun}) ===`);
 
-  // 1. Initialize Database
+  // 1. Ensure required directories exist for ephemeral runners
+  const fs = require('fs').promises;
+  const path = require('path');
+  const requiredDirs = [
+    'uploads',
+    'uploads/thumbnails',
+    'uploads/videos',
+    'data',
+    'data/production',
+    'data/assets',
+    'data/videos',
+    'data/audio',
+    'data/scripts',
+    'data/captions',
+    'temp',
+    'temp/processing',
+    'logs'
+  ];
+  for (const dir of requiredDirs) {
+    await fs.mkdir(path.resolve(process.cwd(), dir), { recursive: true }).catch(() => {});
+  }
+
+  // 2. Initialize Database
   const db = options.db || new Database();
   await db.initialize();
 
-  // 2. Initialize Credentials
+  // 3. Initialize Credentials
   const credentials = options.credentials || new CredentialManager();
   await credentials.initialize();
 
-  // 3. Timezone and Quota settings
+  // 4. Timezone and Quota settings
   const tz = await getTimezone(db, 'youtube');
   const dailyTarget = await getDailyTarget(db, 'youtube');
   const now = new Date();
@@ -82,7 +104,7 @@ async function runCloudPipelineCycle(options = {}) {
 
   logger.info(`Audience Timezone: ${tz} | Target: ${dailyTarget} videos/day | Date: ${todayStr}`);
 
-  // 4. Validate credentials
+  // 5. Validate credentials
   const hasAIText = credentials.hasAITextProvider();
   const hasYouTube = Boolean(credentials.credentials.youtube && credentials.tokens?.youtube);
 
@@ -98,7 +120,7 @@ async function runCloudPipelineCycle(options = {}) {
     return { status: 'FAILED', reason: 'MISSING_YOUTUBE_CREDENTIALS' };
   }
 
-  // 5. Initialize Agents
+  // 6. Initialize Agents
   const agents = options.agents || {
     strategy: new ContentStrategyAgent(db, credentials),
     scriptWriter: new ScriptWriterAgent(db, credentials),
@@ -108,30 +130,20 @@ async function runCloudPipelineCycle(options = {}) {
     publishing: hasYouTube ? new PublishingSchedulingAgent(db, credentials) : null
   };
 
-  if (agents.strategy) {
-    await agents.strategy.initialize().catch(err => {
-      logger.warn(`Strategy agent initialization warning: ${err.message}`);
-    });
+  for (const [name, agent] of Object.entries(agents)) {
+    if (agent && typeof agent.initialize === 'function') {
+      await agent.initialize().catch(err => {
+        logger.warn(`${name} agent initialization warning: ${err.message}`);
+      });
+    }
   }
 
-  if (!isDryRun) {
-    if (!agents.publishing) {
-      logger.error('FAIL-CLOSED: Publishing agent could not be instantiated in live mode.');
-      return { status: 'FAILED', reason: 'PUBLISHING_AGENT_UNAVAILABLE' };
-    }
-    try {
-      await agents.publishing.initialize();
-    } catch (err) {
-      logger.error(`FAIL-CLOSED: Publishing agent initialization failed: ${err.message}`);
-      return { status: 'FAILED', reason: 'PUBLISHING_INITIALIZE_FAILED', error: err.message };
-    }
-  } else if (agents.publishing) {
-    await agents.publishing.initialize().catch(err => {
-      logger.warn(`Publishing agent initialization warning: ${err.message}`);
-    });
+  if (!isDryRun && !agents.publishing) {
+    logger.error('FAIL-CLOSED: Publishing agent could not be instantiated in live mode.');
+    return { status: 'FAILED', reason: 'PUBLISHING_AGENT_UNAVAILABLE' };
   }
 
-  // 6. Check existing uploads today to enforce daily cap (6/day)
+  // 7. Check existing uploads today to enforce daily cap (6/day)
   let uploadedToday = 0;
   if (db.getAllRows) {
     const rows = await db.getAllRows(
@@ -139,6 +151,20 @@ async function runCloudPipelineCycle(options = {}) {
        WHERE status = 'published' AND published_at IS NOT NULL`
     ).catch(() => []);
     uploadedToday = (rows || []).filter(r => getLocalDateString(new Date(r.published_at), tz) === todayStr).length;
+  }
+
+  // Cross-verify with live YouTube channel uploads count if YouTube credentials are active
+  // Guarantees quota enforcement even if GitHub Actions cache is evicted or clean runner has empty DB!
+  if (agents.publishing && typeof agents.publishing.getChannelUploadsCountToday === 'function') {
+    try {
+      const liveCheck = await agents.publishing.getChannelUploadsCountToday(tz);
+      if (liveCheck && typeof liveCheck.count === 'number') {
+        logger.info(`Live YouTube channel uploads verified today: ${liveCheck.count}`);
+        uploadedToday = Math.max(uploadedToday, liveCheck.count);
+      }
+    } catch (ytCheckErr) {
+      logger.warn(`Could not cross-check live YouTube uploads: ${ytCheckErr.message}`);
+    }
   }
 
   logger.info(`Progress today: ${uploadedToday}/${dailyTarget} published on ${todayStr} [${tz}]`);

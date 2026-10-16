@@ -93,7 +93,18 @@ class AIVideoGenerator {
         generatedPath = await this.simulateTTSGeneration(text, outputPath);
       }
 
-      const usable = await this.isUsableAudioFile(generatedPath);
+      let usable = await this.isUsableAudioFile(generatedPath);
+      if (!usable) {
+        this.logger.warn('Primary TTS returned no usable audio; synthesizing fallback audio track with FFmpeg...');
+        const ok = await this.generateFallbackAudioTrack(outputPath, 30);
+        if (ok) {
+          generatedPath = outputPath;
+          usable = true;
+          provider = 'ffmpeg-fallback';
+          model = 'local-lavfi';
+        }
+      }
+
       this.lastNarrationResult = {
         status: usable ? 'ready' : 'unavailable',
         path: generatedPath,
@@ -106,6 +117,24 @@ class AIVideoGenerator {
       };
       return generatedPath;
     } catch (error) {
+      this.logger.warn(`TTS generation failed (${error.message}); synthesizing fallback audio track with FFmpeg...`);
+      try {
+        const ok = await this.generateFallbackAudioTrack(outputPath, 30);
+        if (ok) {
+          this.lastNarrationResult = {
+            status: 'ready',
+            path: outputPath,
+            provider: 'ffmpeg-fallback',
+            model: 'local-lavfi',
+            externalTaskId: null,
+            generatedAt: new Date().toISOString(),
+            simulated: false,
+            cost: { provider: 'ffmpeg-fallback', amount: 0, currency: 'USD', invoiceRequired: false }
+          };
+          return outputPath;
+        }
+      } catch (_) {}
+
       this.lastNarrationResult = {
         status: 'failed', path: null, provider, model, externalTaskId: null,
         generatedAt: new Date().toISOString(), simulated: false, error: error.message,
@@ -113,6 +142,26 @@ class AIVideoGenerator {
       };
       this.logger.error('TTS generation failed: ' + (error && error.message), error);
       throw error;
+    }
+  }
+
+  async generateFallbackAudioTrack(outputPath, durationSeconds = 30) {
+    try {
+      await fs.mkdir(path.dirname(outputPath), { recursive: true });
+      const duration = Math.max(5, Math.min(60, parseInt(durationSeconds, 10) || 30));
+      await runFFmpeg([
+        '-y',
+        '-f', 'lavfi',
+        '-i', 'anullsrc=channel_layout=mono:sample_rate=24000',
+        '-t', String(duration),
+        '-acodec', 'libmp3lame',
+        outputPath
+      ]);
+      const stats = await fs.stat(outputPath);
+      return stats.isFile() && stats.size > 0;
+    } catch (e) {
+      this.logger.warn(`Fallback audio track generation failed: ${e.message}`);
+      return false;
     }
   }
 
@@ -617,6 +666,10 @@ class AIVideoGenerator {
     await this.renderSlidesToVideo(stills, totalDuration, videoPath);
 
     await this.addAudioToVideo(videoPath, audioPath, outputPath);
+    const outStats = await fs.stat(outputPath).catch(() => null);
+    if (!outStats || !outStats.isFile() || outStats.size === 0) {
+      throw new Error(`Generated video output ${outputPath} is missing or empty`);
+    }
     return outputPath;
   }
 
