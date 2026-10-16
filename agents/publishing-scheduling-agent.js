@@ -355,14 +355,17 @@ class PublishingSchedulingAgent {
       }
       
       // Update database and registry
-      scheduleEntry.status = 'published';
-      scheduleEntry.publishedAt = new Date().toISOString();
+      const isScheduled = scheduleEntry.status === 'scheduled';
+      if (!isScheduled) {
+        scheduleEntry.status = 'published';
+        scheduleEntry.publishedAt = new Date().toISOString();
+      }
       scheduleEntry.youtubeId = uploadResult.id;
       scheduleEntry.youtubeUrl = `https://www.youtube.com/watch?v=${uploadResult.id}`;
       scheduleEntry.error = null;
       
       await this.db.updateScheduleEntry(scheduleEntry);
-      await this.syncShortStatus(scheduleEntry, 'published');
+      await this.syncShortStatus(scheduleEntry, scheduleEntry.status);
 
       if (contentHash && this.db.savePublishedMediaRegistry) {
         await this.db.savePublishedMediaRegistry({
@@ -371,14 +374,17 @@ class PublishingSchedulingAgent {
           productionId: scheduleEntry.productionId,
           platformPostId: uploadResult.id,
           platformUrl: scheduleEntry.youtubeUrl,
-          publishedAt: scheduleEntry.publishedAt
+          publishedAt: scheduleEntry.publishedAt || scheduleEntry.publishTime
         }).catch(() => {});
       }
       
-      // Remove from queue
-      this.publishQueue = this.publishQueue.filter(entry => entry.productionId !== scheduleEntry.productionId);
-      
-      this.logger.success(`Content published: ${scheduleEntry.youtubeUrl}`);
+      // Remove from memory queue if already published
+      if (!isScheduled) {
+        this.publishQueue = this.publishQueue.filter(entry => entry.productionId !== scheduleEntry.productionId);
+        this.logger.success(`Content published: ${scheduleEntry.youtubeUrl}`);
+      } else {
+        this.logger.success(`Content scheduled on YouTube for ${scheduleEntry.publishTime}: ${scheduleEntry.youtubeUrl}`);
+      }
       return scheduleEntry;
     } catch (error) {
       this.logger.error(
@@ -399,7 +405,9 @@ class PublishingSchedulingAgent {
     // Prepare video metadata
     const requestedPrivacy = metadata.privacyStatus || process.env.DEFAULT_PRIVACY_STATUS || 'public';
     const scheduledFor = new Date(scheduleEntry.publishTime);
-    const futureSchedule = !options.publishNow && Number.isFinite(scheduledFor.getTime()) && scheduledFor.getTime() > Date.now() + 60000;
+    const isFutureSchedule = Number.isFinite(scheduledFor.getTime()) && scheduledFor.getTime() > Date.now() + 60000;
+    const shouldSchedule = (options.schedulePublish || (!options.publishNow && isFutureSchedule)) && isFutureSchedule;
+
     const videoMetadata = {
       snippet: {
         title: safeMetadata.title,
@@ -410,12 +418,17 @@ class PublishingSchedulingAgent {
         defaultAudioLanguage: safeMetadata.defaultAudioLanguage
       },
       status: {
-        privacyStatus: requestedPrivacy,
+        privacyStatus: shouldSchedule ? 'private' : requestedPrivacy,
         selfDeclaredMadeForKids: false,
         containsSyntheticMedia: metadata.containsSyntheticMedia === true
       }
     };
-    // Direct public upload: no YouTube publishAt/private staging.
+
+    if (shouldSchedule) {
+      // YouTube Requirement: status.privacyStatus MUST be 'private' when publishAt is set
+      videoMetadata.status.publishAt = scheduledFor.toISOString();
+      this.logger.info(`Configured YouTube scheduled publishing for: ${videoMetadata.status.publishAt} (privacy: private)`);
+    }
     
     // Resolve the file before marking the network upload as attempted.
     const videoStream = await this.getVideoStream(metadata.video.path);
@@ -440,10 +453,16 @@ class PublishingSchedulingAgent {
       throw new Error('YouTube videos.insert succeeded but returned no valid video ID in response');
     }
     this.logger.info(`Video uploaded with ID: ${videoId}`);
-    scheduleEntry.status = 'uploaded';
+    scheduleEntry.status = shouldSchedule ? 'scheduled' : 'uploaded';
     scheduleEntry.youtubeId = videoId;
     scheduleEntry.youtubeUrl = `https://www.youtube.com/watch?v=${videoId}`;
     scheduleEntry.error = null;
+    if (shouldSchedule) {
+      scheduleEntry.metadata = scheduleEntry.metadata || {};
+      scheduleEntry.metadata.scheduledPublishAt = scheduledFor.toISOString();
+      scheduleEntry.metadata.privacyStatus = 'private';
+      scheduleEntry.metadata.scheduledVia = 'youtube_publish_at';
+    }
     await this.db.updateScheduleEntry(scheduleEntry);
     
     // Upload thumbnail
@@ -529,6 +548,228 @@ class PublishingSchedulingAgent {
     } catch (err) {
       this.logger.warn(`Could not fetch channel uploads from YouTube API: ${err.message}`);
       return null;
+    }
+  }
+
+  /**
+   * Fetches recent uploaded videos from the YouTube channel with their privacy and scheduled status.
+   *
+   * @param {number} limit
+   * @returns {Promise<Array>} List of videos with id, title, publishedAt, privacyStatus, publishAt
+   */
+  async getChannelRecentVideos(limit = 10) {
+    if (this.isDryRun || !this.youtube) {
+      return [];
+    }
+    try {
+      const channelRes = await this.youtube.channels.list({
+        part: 'contentDetails',
+        mine: true
+      });
+      const uploadsPlaylistId = channelRes.data.items?.[0]?.contentDetails?.relatedPlaylists?.uploads;
+      if (!uploadsPlaylistId) return [];
+
+      const playlistRes = await this.youtube.playlistItems.list({
+        part: 'snippet',
+        playlistId: uploadsPlaylistId,
+        maxResults: Math.min(50, limit)
+      });
+
+      const videoIds = (playlistRes.data.items || []).map(item => item.snippet?.resourceId?.videoId).filter(Boolean);
+      if (videoIds.length === 0) return [];
+
+      const videosRes = await this.youtube.videos.list({
+        part: 'snippet,status',
+        id: videoIds.join(',')
+      });
+
+      return (videosRes.data.items || []).map(v => ({
+        id: v.id,
+        title: v.snippet?.title,
+        description: v.snippet?.description,
+        publishedAt: v.snippet?.publishedAt,
+        privacyStatus: v.status?.privacyStatus,
+        publishAt: v.status?.publishAt || null,
+        uploadStatus: v.status?.uploadStatus
+      }));
+    } catch (err) {
+      this.logger.warn(`Could not fetch recent channel videos: ${err.message}`);
+      return [];
+    }
+  }
+
+  /**
+   * Schedules an already-uploaded video on YouTube using YouTube's status.publishAt.
+   * YouTube API Requirement: status.privacyStatus MUST be set to 'private' when setting publishAt.
+   *
+   * @param {string} videoId - The YouTube Video ID
+   * @param {string|Date} publishTime - The ISO string or Date for future publishing
+   * @param {object} options - Options including title, dryRun, force
+   * @returns {Promise<object>} The update result and persisted schedule record
+   */
+  async scheduleUploadedVideo(videoId, publishTime, options = {}) {
+    if (!videoId || typeof videoId !== 'string') {
+      throw new Error('Valid YouTube videoId is required to schedule');
+    }
+
+    const scheduledDate = new Date(publishTime);
+    if (!Number.isFinite(scheduledDate.getTime())) {
+      throw new Error(`Invalid publishTime: ${publishTime}`);
+    }
+
+    if (scheduledDate.getTime() <= Date.now() + 60000) {
+      throw new Error(`publishTime must be in the future (at least 60 seconds from now). Got: ${scheduledDate.toISOString()}`);
+    }
+
+    const isoPublishAt = scheduledDate.toISOString();
+    const isDryRun = typeof options.dryRun === 'boolean' ? options.dryRun : this.isDryRun;
+
+    this.logger.info(`Scheduling YouTube video ${videoId} for ${isoPublishAt} (privacy: private)...`);
+
+    if (isDryRun) {
+      this.logger.info(`[DRY RUN] Would update video ${videoId} status: privacyStatus='private', publishAt='${isoPublishAt}'`);
+      const simulatedResult = {
+        videoId,
+        youtubeUrl: `https://www.youtube.com/watch?v=${videoId}`,
+        publishTime: isoPublishAt,
+        privacyStatus: 'private',
+        status: 'scheduled',
+        simulated: true
+      };
+
+      if (this.db) {
+        simulatedResult.scheduleRecord = await this.persistScheduledVideoRecord(videoId, isoPublishAt, options);
+      }
+
+      return simulatedResult;
+    }
+
+    if (!this.youtube || !this.youtube.videos) {
+      throw new Error('YouTube API client is not initialized');
+    }
+
+    // 1. Fetch current video status to prevent duplicate scheduling or modifying already Public videos
+    let currentVideo = null;
+    try {
+      const listRes = await this.youtube.videos.list({
+        part: 'snippet,status',
+        id: videoId
+      });
+      currentVideo = listRes?.data?.items?.[0];
+    } catch (err) {
+      this.logger.warn(`Could not verify current YouTube status for ${videoId}: ${err.message}`);
+    }
+
+    if (currentVideo) {
+      const curPrivacy = currentVideo.status?.privacyStatus;
+      const curPublishAt = currentVideo.status?.publishAt;
+
+      if (curPrivacy === 'public') {
+        throw new Error(`Cannot schedule video ${videoId}: it is already Public. YouTube only allows scheduling unlisted/private videos.`);
+      }
+
+      if (curPrivacy === 'private' && curPublishAt === isoPublishAt && !options.force) {
+        this.logger.info(`Video ${videoId} is already scheduled for ${isoPublishAt}. Skipping API call.`);
+        const record = await this.persistScheduledVideoRecord(videoId, isoPublishAt, {
+          title: currentVideo.snippet?.title || options.title,
+          ...options
+        });
+        return {
+          videoId,
+          youtubeUrl: `https://www.youtube.com/watch?v=${videoId}`,
+          publishTime: isoPublishAt,
+          privacyStatus: 'private',
+          status: 'scheduled',
+          alreadyScheduled: true,
+          scheduleRecord: record
+        };
+      }
+    }
+
+    // 2. Execute videos.update with status.privacyStatus='private' and status.publishAt
+    const updateRes = await this.youtube.videos.update({
+      part: 'status',
+      requestBody: {
+        id: videoId,
+        status: {
+          privacyStatus: 'private',
+          publishAt: isoPublishAt,
+          selfDeclaredMadeForKids: false
+        }
+      }
+    });
+
+    this.logger.success(`YouTube video ${videoId} scheduled successfully for ${isoPublishAt}`);
+
+    // 3. Persist record to durable DB storage
+    const savedRecord = await this.persistScheduledVideoRecord(videoId, isoPublishAt, {
+      title: currentVideo?.snippet?.title || options.title,
+      ...options
+    });
+
+    return {
+      videoId,
+      youtubeUrl: `https://www.youtube.com/watch?v=${videoId}`,
+      publishTime: isoPublishAt,
+      privacyStatus: 'private',
+      status: 'scheduled',
+      scheduleRecord: savedRecord,
+      youtubeData: updateRes?.data
+    };
+  }
+
+  /**
+   * Persists or updates the scheduled video record in publish_schedule.
+   */
+  async persistScheduledVideoRecord(videoId, publishTimeIso, options = {}) {
+    if (!this.db) return null;
+
+    let existing = null;
+    if (this.db.getAllRows) {
+      const rows = await this.db.getAllRows(
+        `SELECT * FROM publish_schedule WHERE youtube_id = ? ORDER BY created_at DESC LIMIT 1`,
+        [videoId]
+      ).catch(() => []);
+      existing = rows?.[0];
+    }
+
+    if (existing) {
+      existing.status = 'scheduled';
+      existing.publish_time = publishTimeIso;
+      existing.published_at = null;
+      let meta = {};
+      try {
+        meta = typeof existing.metadata === 'string' ? JSON.parse(existing.metadata || '{}') : (existing.metadata || {});
+      } catch (_) {}
+      meta.privacyStatus = 'private';
+      meta.scheduledPublishAt = publishTimeIso;
+      meta.scheduledVia = 'youtube_publish_at';
+      existing.metadata = meta;
+
+      await this.db.updateScheduleEntry(existing);
+      this.logger.info(`Durable storage updated for video ${videoId} -> scheduled for ${publishTimeIso}`);
+      return existing;
+    } else {
+      const newEntry = {
+        id: `schedule_yt_${videoId}_${Date.now()}`,
+        productionId: options.productionId || `prod_yt_${videoId}`,
+        title: options.title || `Scheduled Short (${videoId})`,
+        publishTime: publishTimeIso,
+        status: 'scheduled',
+        priority: 50,
+        youtube_id: videoId,
+        youtube_url: `https://www.youtube.com/watch?v=${videoId}`,
+        metadata: {
+          privacyStatus: 'private',
+          scheduledPublishAt: publishTimeIso,
+          scheduledVia: 'youtube_publish_at'
+        },
+        createdAt: new Date().toISOString()
+      };
+
+      const saved = await this.db.saveScheduleEntry(newEntry);
+      this.logger.info(`Durable storage created for video ${videoId} -> scheduled for ${publishTimeIso}`);
+      return saved || newEntry;
     }
   }
 

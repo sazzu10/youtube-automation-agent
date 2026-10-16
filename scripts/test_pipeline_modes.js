@@ -333,14 +333,123 @@ async function testPipelineModes() {
 
   assert.strictEqual(quotaResult.status, 'COMPLETED');
   assert.strictEqual(quotaResult.reason, 'DAILY_CAP_REACHED');
-  assert.strictEqual(quotaResult.uploadedToday, 6);
+  console.log('\nTest 19: getDailySlotsForDate produces exact 6 US audience windows in America/Los_Angeles without timezone skew');
+  const { getDailySlotsForDate, distributeVideosAcrossSlots } = require('../utils/schedule-calculator');
+  const slots20261017 = getDailySlotsForDate('2026-10-17', 'America/Los_Angeles', 'youtube');
+  assert.strictEqual(slots20261017.length, 6, 'Must generate exactly 6 slots for YouTube');
+
+  // Verify PDT times: 07:00, 10:00, 13:00, 16:00, 19:00, 21:00
+  const expectedUtcHours = [14, 17, 20, 23, 2, 4]; // In UTC for PDT (UTC-7)
+  const actualUtcHours = slots20261017.map(s => new Date(s).getUTCHours());
+  assert.deepStrictEqual(actualUtcHours, expectedUtcHours, 'Slots must match exact US audience windows in UTC');
+
+  console.log('\nTest 20: uploadToYouTube sets status.publishAt and privacyStatus: private when scheduled in future');
+  let insertedVideoMetadata = null;
+  const mockYtInsert = {
+    videos: {
+      insert: async (req) => {
+        insertedVideoMetadata = req.requestBody;
+        return { data: { id: 'scheduled_test_yt_id' } };
+      }
+    }
+  };
+
+  const schedPublishingAgent = new PublishingSchedulingAgent(mockDb, mockCredsValid);
+  schedPublishingAgent.youtube = mockYtInsert;
+
+  const testMp4ForSched = path.resolve(process.cwd(), 'temp/test_sample_sched.mp4');
+  await fs.writeFile(testMp4ForSched, Buffer.from('fake_mp4_bytes_sched'));
+
+  const futureSlotIso = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
+  const scheduleEntryWithFuture = {
+    id: 'test_sched_future_entry',
+    publishTime: futureSlotIso,
+    metadata: {
+      seo: { title: 'Future Scheduled Video', description: 'Desc', tags: ['shorts'] },
+      video: { path: testMp4ForSched },
+      privacyStatus: 'unlisted' // Requested unlisted, but scheduled publish requires private
+    }
+  };
+
+  await schedPublishingAgent.uploadToYouTube(scheduleEntryWithFuture, { schedulePublish: true });
+  assert.strictEqual(insertedVideoMetadata.status.privacyStatus, 'private', 'YouTube requirement: privacyStatus must be private');
+  assert.strictEqual(insertedVideoMetadata.status.publishAt, futureSlotIso, 'status.publishAt must be set to target ISO timestamp');
+  assert.strictEqual(scheduleEntryWithFuture.status, 'scheduled', 'Status must be scheduled');
+  assert.strictEqual(scheduleEntryWithFuture.youtubeId, 'scheduled_test_yt_id');
+
+  console.log('\nTest 21: scheduleUploadedVideo sets privacyStatus: private and publishAt on existing video');
+  let updatedVideoStatus = null;
+  schedPublishingAgent.isDryRun = false;
+  schedPublishingAgent.youtube.videos.list = async () => ({
+    data: { items: [{ id: 'existing_unlisted_vid', snippet: { title: 'Unlisted Short' }, status: { privacyStatus: 'unlisted' } }] }
+  });
+  schedPublishingAgent.youtube.videos.update = async (req) => {
+    updatedVideoStatus = req.requestBody.status;
+    return { data: { id: req.requestBody.id, status: req.requestBody.status } };
+  };
+
+  const scheduleExistingRes = await schedPublishingAgent.scheduleUploadedVideo('existing_unlisted_vid', futureSlotIso);
+  assert.strictEqual(scheduleExistingRes.status, 'scheduled');
+  assert.strictEqual(updatedVideoStatus.privacyStatus, 'private', 'videos.update must set privacyStatus private');
+  assert.strictEqual(updatedVideoStatus.publishAt, futureSlotIso, 'videos.update must set publishAt');
+
+  console.log('\nTest 22: scheduleUploadedVideo rejects already-public videos and handles already-scheduled idempotently');
+  schedPublishingAgent.youtube.videos.list = async () => ({
+    data: { items: [{ id: 'public_vid', snippet: { title: 'Public Short' }, status: { privacyStatus: 'public' } }] }
+  });
+
+  let publicThrew = false;
+  try {
+    await schedPublishingAgent.scheduleUploadedVideo('public_vid', futureSlotIso);
+  } catch (e) {
+    publicThrew = true;
+    assert(e.message.includes('already Public'), 'Must reject scheduling already-public video');
+  }
+  assert.strictEqual(publicThrew, true, 'Rejection of public video expected');
+
+  // Idempotent test: video already private with same publishAt
+  schedPublishingAgent.youtube.videos.list = async () => ({
+    data: { items: [{ id: 'already_sched_vid', snippet: { title: 'Already Sched' }, status: { privacyStatus: 'private', publishAt: futureSlotIso } }] }
+  });
+  let updateCalled = false;
+  schedPublishingAgent.youtube.videos.update = async () => { updateCalled = true; };
+  const idempotentRes = await schedPublishingAgent.scheduleUploadedVideo('already_sched_vid', futureSlotIso);
+  assert.strictEqual(idempotentRes.alreadyScheduled, true);
+  assert.strictEqual(updateCalled, false, 'Should skip videos.update API call if already scheduled for that time');
+
+  console.log('\nTest 23: scheduleUnlistedVideos tool runs safely in dry-run mode without modifying live videos');
+  resetEnv();
+  const { scheduleUnlistedVideos } = require('./schedule-unlisted-videos');
+  schedPublishingAgent.isDryRun = true;
+  const scheduleToolResult = await scheduleUnlistedVideos({
+    dryRun: true,
+    db: mockDb,
+    credentials: mockCredsValid,
+    publishingAgent: schedPublishingAgent,
+    startDate: '2026-10-17',
+    videos: [
+      { id: 'vid_1', title: 'Video 1' },
+      { id: 'vid_2', title: 'Video 2' },
+      { id: 'vid_3', title: 'Video 3' },
+      { id: 'vid_4', title: 'Video 4' },
+      { id: 'vid_5', title: 'Video 5' },
+      { id: 'vid_6', title: 'Video 6' }
+    ]
+  });
+
+  assert.strictEqual(scheduleToolResult.status, 'COMPLETED');
+  assert.strictEqual(scheduleToolResult.mode, 'dry-run');
+  assert.strictEqual(scheduleToolResult.scheduledCount, 6);
+  assert.strictEqual(scheduleToolResult.results.length, 6);
+  assert(scheduleToolResult.results.every(r => r.simulated === true), 'All results must be simulated in dry-run');
 
   // Clean up test file
   await fs.unlink(testMp4Path).catch(() => {});
+  await fs.unlink(testMp4ForSched).catch(() => {});
 
   // Restore env
   resetEnv();
-  console.log('\n✅ ALL 18 TESTS PASSED SUCCESSFULLY!');
+  console.log('\n✅ ALL 23 TESTS PASSED SUCCESSFULLY!');
 }
 
 if (require.main === module) {

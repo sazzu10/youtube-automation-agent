@@ -91,19 +91,37 @@ function getLocalDateString(date, timezone) {
 
 /**
  * Creates a UTC Date representing the target local date, hour, minute in the specified timezone.
+ * Robust against any host system timezone using formatToParts.
  */
 function createDateInTimezone(year, month, day, hour, minute, timezone) {
-  // Use ISO representation and resolve offset using Intl
-  const paddedMonth = String(month).padStart(2, '0');
-  const paddedDay = String(day).padStart(2, '0');
-  const paddedHour = String(hour).padStart(2, '0');
-  const paddedMinute = String(minute).padStart(2, '0');
+  const utcEstimate = Date.UTC(year, month - 1, day, hour, minute, 0, 0);
 
-  // Find UTC timestamp matching this local time
-  const naiveUtc = new Date(`${year}-${paddedMonth}-${paddedDay}T${paddedHour}:${paddedMinute}:00Z`);
-  const invDate = new Date(naiveUtc.toLocaleString('en-US', { timeZone: timezone }));
-  const diff = naiveUtc.getTime() - invDate.getTime();
-  return new Date(naiveUtc.getTime() + diff);
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: 'numeric',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: 'numeric',
+    second: 'numeric',
+    hour12: false
+  });
+
+  const parts = formatter.formatToParts(new Date(utcEstimate));
+  const partMap = {};
+  for (const p of parts) partMap[p.type] = p.value;
+
+  let localH = parseInt(partMap.hour, 10);
+  if (localH === 24) localH = 0;
+  const localM = parseInt(partMap.minute, 10);
+  const localD = parseInt(partMap.day, 10);
+  const localMo = parseInt(partMap.month, 10);
+  const localY = parseInt(partMap.year, 10);
+
+  const localTimeMs = Date.UTC(localY, localMo - 1, localD, localH, localM, 0, 0);
+  const offsetMs = localTimeMs - utcEstimate;
+
+  return new Date(utcEstimate - offsetMs);
 }
 
 /**
@@ -270,11 +288,74 @@ async function getDailyQuotaMetrics(db) {
   };
 }
 
+/**
+ * Calculates all daily template slots for a specified calendar date string (YYYY-MM-DD)
+ * or Date object in the target timezone (defaults to America/Los_Angeles).
+ * Returns an array of ISO 8601 strings.
+ */
+function getDailySlotsForDate(dateInput, timezone = 'America/Los_Angeles', platform = 'youtube') {
+  const dateStr = typeof dateInput === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(dateInput)
+    ? dateInput
+    : getLocalDateString(new Date(dateInput || Date.now()), timezone);
+  const [year, month, day] = dateStr.split('-').map(Number);
+  const templates = DAILY_SLOT_TEMPLATES[platform] || DAILY_SLOT_TEMPLATES.youtube;
+
+  return templates.map(slot => {
+    return createDateInTimezone(year, month, day, slot.hour, slot.minute, timezone).toISOString();
+  });
+}
+
+/**
+ * Distributes a list of items/videos across upcoming US audience slots.
+ * Starts from the next available slot at or after minFutureTime, ensuring each slot is in the future.
+ */
+async function distributeVideosAcrossSlots({
+  count = 6,
+  now = new Date(),
+  timezone = 'America/Los_Angeles',
+  platform = 'youtube',
+  startDate = null
+} = {}) {
+  const slots = [];
+  const minFutureTime = new Date(now.getTime() + 5 * 60 * 1000); // 5 min buffer
+  const templates = DAILY_SLOT_TEMPLATES[platform] || DAILY_SLOT_TEMPLATES.youtube;
+  
+  let currentDayOffset = 0;
+  if (startDate) {
+    const startStr = typeof startDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(startDate)
+      ? startDate
+      : getLocalDateString(new Date(startDate), timezone);
+    const todayStr = getLocalDateString(now, timezone);
+    const msDiff = new Date(startStr + 'T00:00:00Z').getTime() - new Date(todayStr + 'T00:00:00Z').getTime();
+    currentDayOffset = Math.max(0, Math.round(msDiff / (24 * 60 * 60 * 1000)));
+  }
+
+  while (slots.length < count && currentDayOffset < 60) {
+    const checkDate = new Date(now.getTime() + currentDayOffset * 24 * 60 * 60 * 1000);
+    const dateStr = getLocalDateString(checkDate, timezone);
+    const [year, month, day] = dateStr.split('-').map(Number);
+
+    for (const t of templates) {
+      if (slots.length >= count) break;
+      const candidate = createDateInTimezone(year, month, day, t.hour, t.minute, timezone);
+      if (candidate.getTime() >= minFutureTime.getTime()) {
+        slots.push(candidate.toISOString());
+      }
+    }
+    currentDayOffset++;
+  }
+
+  return slots;
+}
+
 module.exports = {
   getDailyTarget,
   getTimezone,
   getLocalDateString,
   getExistingPostsForDay,
   getNextAvailableScheduleSlot,
-  getDailyQuotaMetrics
+  getDailyQuotaMetrics,
+  getDailySlotsForDate,
+  distributeVideosAcrossSlots,
+  DAILY_SLOT_TEMPLATES
 };

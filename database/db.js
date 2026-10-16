@@ -1892,22 +1892,27 @@ class Database {
   }
 
   async updateScheduleEntry(entry) {
+    let metaStr = null;
+    if (entry.metadata) {
+      metaStr = typeof entry.metadata === 'string' ? entry.metadata : JSON.stringify(entry.metadata);
+    }
     await this.executeQuery(
       `UPDATE publish_schedule SET 
         title = COALESCE(?, title), publish_time = COALESCE(?, publish_time),
         status = ?, priority = COALESCE(?, priority), metadata = COALESCE(?, metadata),
-        youtube_id = ?, youtube_url = ?, published_at = ?, error_message = ?
+        youtube_id = COALESCE(?, youtube_id), youtube_url = COALESCE(?, youtube_url),
+        published_at = ?, error_message = ?
       WHERE id = ?`,
       [
         entry.title || null,
         entry.publishTime || entry.publish_time || null,
         entry.status,
         entry.priority ?? null,
-        entry.metadata ? JSON.stringify(entry.metadata) : null,
-        entry.youtubeId || null,
-        entry.youtubeUrl || null,
-        entry.publishedAt || null,
-        entry.error || null,
+        metaStr,
+        entry.youtubeId ?? entry.youtube_id ?? null,
+        entry.youtubeUrl ?? entry.youtube_url ?? null,
+        entry.publishedAt ?? entry.published_at ?? null,
+        entry.error ?? entry.error_message ?? null,
         entry.id
       ]
     );
