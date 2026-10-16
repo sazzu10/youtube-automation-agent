@@ -6,6 +6,11 @@ const chalk = require('chalk');
 const { Logger } = require('./logger');
 const { PROVIDERS, GEMINI_MODELS, GEMINI_DEFAULT_MODEL } = require('./ai-text-service');
 
+function sanitizeSecret(val) {
+  if (!val || typeof val !== 'string') return '';
+  return val.trim().replace(/^["']|["']$/g, '').trim();
+}
+
 class CredentialManager {
   constructor() {
     this.logger = new Logger('CredentialManager');
@@ -41,11 +46,25 @@ class CredentialManager {
           this.credentials.youtube = parsed.installed || parsed.web || parsed.youtube || parsed;
         } catch (_) {}
       } else if (process.env.YOUTUBE_CLIENT_ID && process.env.YOUTUBE_CLIENT_SECRET) {
-        this.credentials.youtube = {
-          client_id: process.env.YOUTUBE_CLIENT_ID,
-          client_secret: process.env.YOUTUBE_CLIENT_SECRET,
-          redirect_uris: [process.env.YOUTUBE_REDIRECT_URI || 'http://localhost:8080/oauth2callback']
-        };
+        const clientId = sanitizeSecret(process.env.YOUTUBE_CLIENT_ID);
+        const clientSecret = sanitizeSecret(process.env.YOUTUBE_CLIENT_SECRET);
+        const redirectUri = sanitizeSecret(process.env.YOUTUBE_REDIRECT_URI) || 'http://localhost:8080/oauth2callback';
+        if (clientId && clientSecret) {
+          this.credentials.youtube = {
+            client_id: clientId,
+            client_secret: clientSecret,
+            redirect_uris: [redirectUri]
+          };
+        }
+      }
+    }
+
+    if (this.credentials?.youtube) {
+      if (typeof this.credentials.youtube.client_id === 'string') {
+        this.credentials.youtube.client_id = sanitizeSecret(this.credentials.youtube.client_id);
+      }
+      if (typeof this.credentials.youtube.client_secret === 'string') {
+        this.credentials.youtube.client_secret = sanitizeSecret(this.credentials.youtube.client_secret);
       }
     }
   }
@@ -65,12 +84,19 @@ class CredentialManager {
           this.tokens.youtube = parsed.youtube || parsed;
         } catch (_) {}
       } else if (process.env.YOUTUBE_REFRESH_TOKEN) {
-        this.tokens.youtube = {
-          refresh_token: process.env.YOUTUBE_REFRESH_TOKEN,
-          scope: process.env.YOUTUBE_SCOPE || 'https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube',
-          token_type: 'Bearer'
-        };
+        const refreshToken = sanitizeSecret(process.env.YOUTUBE_REFRESH_TOKEN);
+        if (refreshToken) {
+          this.tokens.youtube = {
+            refresh_token: refreshToken,
+            scope: process.env.YOUTUBE_SCOPE || 'https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube',
+            token_type: 'Bearer'
+          };
+        }
       }
+    }
+
+    if (this.tokens?.youtube && typeof this.tokens.youtube.refresh_token === 'string') {
+      this.tokens.youtube.refresh_token = sanitizeSecret(this.tokens.youtube.refresh_token);
     }
   }
 

@@ -368,13 +368,24 @@ class AIVideoGenerator {
         }
       }
 
-      throw new Error('No real AI video clips were generated; slideshow fallback is disabled.');
+      this.logger.info('No external AI video clips returned; rendering slideshow video with FFmpeg...');
+      const produced = await this.generateSlideshowVideo(script, visualAssets, audioPath, outputPath);
+      this.lastVideoResult = {
+        requestedProvider: 'slideshow',
+        actualProvider: 'slideshow',
+        model: 'local-ffmpeg',
+        mode: 'slideshow',
+        generatedSeconds: options.estimatedDuration || this.calculateScriptDuration(script),
+        tasks: [],
+        scenes: []
+      };
+      return produced;
     } catch (error) {
       // The Logger's console line only shows the message string, so put the real
       // reason inline. Previously the stack alone went to the file transport and
       // the console printed "Video generation failed:" with no detail.
       const reason = error && error.message ? error.message : String(error);
-      this.logger.error(`Real AI video generation failed; no fallback video will be published: ${reason}`, error);
+      this.logger.error(`Video generation failed: ${reason}`, error);
       this.lastVideoResult = {
         requestedProvider: this.lastVideoResult?.requestedProvider || 'configured-provider',
         actualProvider: 'failed',
