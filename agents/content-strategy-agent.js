@@ -9,6 +9,7 @@ class ContentStrategyAgent {
     this.trendingTopics = [];
     this.competitorData = [];
     this.contentCalendar = [];
+    this.historicalPerformance = [];
     this.aiTextService = new AITextService(credentials?.credentials || credentials || {});
   }
 
@@ -22,7 +23,7 @@ class ContentStrategyAgent {
   async loadHistoricalData() {
     try {
       const history = await this.db.getContentHistory();
-      this.historicalPerformance = history;
+      this.historicalPerformance = Array.isArray(history) ? history : [];
     } catch (error) {
       this.logger.warn('No historical data found, starting fresh');
       this.historicalPerformance = [];
@@ -177,18 +178,21 @@ class ContentStrategyAgent {
       .filter(word => word.length > 3 && !stopWords.includes(word));
   }
 
-  mergeTrendData(trends, competitors) {
+  mergeTrendData(trends = [], competitors = []) {
+    const safeTrends = Array.isArray(trends) ? trends : [];
+    const safeCompetitors = Array.isArray(competitors) ? competitors : [];
     const mergedTopics = new Map();
 
     // Add trending topics
-    trends.forEach(trend => {
+    safeTrends.forEach(trend => {
+      if (!trend || !trend.title) return;
       const keywords = this.extractKeywords(trend.title);
       keywords.forEach(keyword => {
         if (!mergedTopics.has(keyword)) {
           mergedTopics.set(keyword, { score: 0, sources: [], evidence: [] });
         }
         const topic = mergedTopics.get(keyword);
-        topic.score += trend.viewCount / 1000000; // Normalize by millions
+        topic.score += (Number(trend.viewCount) || 0) / 1000000; // Normalize by millions
         topic.sources.push('trending');
         topic.evidence.push({
           url: trend.url,
@@ -201,16 +205,17 @@ class ContentStrategyAgent {
     });
 
     // Add competitor topics
-    competitors.forEach(competitor => {
-      if (competitor.topPerformingTopics) {
+    safeCompetitors.forEach(competitor => {
+      if (Array.isArray(competitor?.topPerformingTopics)) {
         competitor.topPerformingTopics.forEach(({ topic, avgViews, evidence = [] }) => {
+          if (!topic) return;
           if (!mergedTopics.has(topic)) {
             mergedTopics.set(topic, { score: 0, sources: [], evidence: [] });
           }
           const topicData = mergedTopics.get(topic);
-          topicData.score += avgViews / 100000; // Normalize
+          topicData.score += (Number(avgViews) || 0) / 100000; // Normalize
           topicData.sources.push('competitor');
-          topicData.evidence.push(...evidence);
+          topicData.evidence.push(...(Array.isArray(evidence) ? evidence : []));
         });
       }
     });
@@ -220,7 +225,7 @@ class ContentStrategyAgent {
       .map(([topic, data]) => ({ topic, ...data }))
       .map(item => ({
         ...item,
-        evidence: [...new Map(item.evidence.filter(source => source.url).map(source => [source.url, source])).values()].slice(0, 5)
+        evidence: [...new Map((item.evidence || []).filter(source => source && source.url).map(source => [source.url, source])).values()].slice(0, 5)
       }))
       .sort((a, b) => b.score - a.score)
       .slice(0, 50);
@@ -451,22 +456,23 @@ Avoid fabricated claims and unsupported numbers.`;
         temperature: 0.7
       });
       const parsed = this.parseAIJsonResponse(response);
-      const topic = String(parsed.topic || requestedTopic || '').trim();
+      const targetObj = Array.isArray(parsed) ? (parsed[0] || {}) : (parsed && typeof parsed === 'object' ? parsed : {});
+      const topic = String(targetObj.topic || requestedTopic || '').trim();
 
       if (!topic) {
         throw new Error('AI strategy response missing topic');
       }
 
-      const contentType = this.normalizeContentType(parsed.contentType, topic);
-      const keywords = Array.isArray(parsed.keywords) && parsed.keywords.length > 0
-        ? parsed.keywords.map(keyword => String(keyword).trim()).filter(Boolean)
+      const contentType = this.normalizeContentType(targetObj.contentType, topic);
+      const keywords = Array.isArray(targetObj.keywords) && targetObj.keywords.length > 0
+        ? targetObj.keywords.map(keyword => String(keyword).trim()).filter(Boolean)
         : this.extractKeywords(topic);
 
       this.logger.info(`Using AI content strategy via ${this.aiTextService.providerName}`);
       return {
         topic,
-        angle: String(parsed.angle || await this.generateAngle(topic)).trim(),
-        targetAudience: String(parsed.targetAudience || await this.identifyTargetAudience(topic)).trim(),
+        angle: String(targetObj.angle || await this.generateAngle(topic)).trim(),
+        targetAudience: String(targetObj.targetAudience || await this.identifyTargetAudience(topic)).trim(),
         contentType,
         keywords,
         estimatedViews: this.predictViews(topic),
@@ -490,11 +496,19 @@ Avoid fabricated claims and unsupported numbers.`;
     try {
       return JSON.parse(withoutFences);
     } catch (error) {
-      const match = withoutFences.match(/\{[\s\S]*\}/);
-      if (!match) {
-        throw error;
+      const objMatch = withoutFences.match(/\{[\s\S]*\}/);
+      if (objMatch) {
+        try {
+          return JSON.parse(objMatch[0]);
+        } catch (_) {}
       }
-      return JSON.parse(match[0]);
+      const arrMatch = withoutFences.match(/\[[\s\S]*\]/);
+      if (arrMatch) {
+        try {
+          return JSON.parse(arrMatch[0]);
+        } catch (_) {}
+      }
+      throw error;
     }
   }
 
@@ -508,18 +522,19 @@ Avoid fabricated claims and unsupported numbers.`;
   selectOptimalTopic() {
     // Use scoring algorithm to select best topic
     const recentTopics = this.getRecentTopics();
+    const trending = Array.isArray(this.trendingTopics) ? this.trendingTopics : [];
 
-    const scoredTopics = this.trendingTopics
-      .filter(topic => !recentTopics.includes(topic.topic))
+    const scoredTopics = trending
+      .filter(topic => topic && topic.topic && !recentTopics.includes(topic.topic))
       .map(topic => ({
         ...topic,
-        finalScore: topic.score * this.getSeasonalMultiplier(topic.topic) * this.getAudienceMultiplier(topic.topic)
+        finalScore: (Number(topic.score) || 1) * this.getSeasonalMultiplier(topic.topic) * this.getAudienceMultiplier(topic.topic)
       }))
       .sort((a, b) => b.finalScore - a.finalScore);
 
     // Single keywords scraped from trending titles ("crown", "official") make
     // meaningless video topics — only use a trend that reads like a real subject.
-    const readable = scoredTopics.find(t => t.topic.trim().includes(' ') && t.topic.trim().length >= 8);
+    const readable = scoredTopics.find(t => t.topic && t.topic.trim().includes(' ') && t.topic.trim().length >= 8);
     if (readable) {
       return readable;
     }
@@ -658,32 +673,37 @@ Avoid fabricated claims and unsupported numbers.`;
   }
 
   getCompetitorInsights(topic) {
-    // Get insights from competitor analysis
+    if (!Array.isArray(this.competitorData) || !topic) return [];
     return this.competitorData
       .filter(competitor => 
+        Array.isArray(competitor?.topPerformingTopics) &&
         competitor.topPerformingTopics.some(t => 
-          t.topic.toLowerCase().includes(topic.toLowerCase())
+          t?.topic && String(t.topic).toLowerCase().includes(String(topic).toLowerCase())
         )
       )
       .map(competitor => ({
         channelId: competitor.channelId,
         averageViews: competitor.averageViews,
-        relevantVideos: competitor.topPerformingTopics.filter(t => 
-          t.topic.toLowerCase().includes(topic.toLowerCase())
+        relevantVideos: (competitor.topPerformingTopics || []).filter(t => 
+          t?.topic && String(t.topic).toLowerCase().includes(String(topic).toLowerCase())
         )
       }));
   }
 
   getRecentTopics() {
     // Get topics used in last 7 days to avoid repetition
-    return this.historicalPerformance
+    const history = Array.isArray(this.historicalPerformance) ? this.historicalPerformance : [];
+    return history
       .filter(content => {
+        if (!content || !content.createdAt) return false;
         const contentDate = new Date(content.createdAt);
+        if (isNaN(contentDate.getTime())) return false;
         const weekAgo = new Date();
         weekAgo.setDate(weekAgo.getDate() - 7);
         return contentDate > weekAgo;
       })
-      .map(content => content.topic);
+      .map(content => content.topic)
+      .filter(Boolean);
   }
 
   getSeasonalMultiplier(topic) {

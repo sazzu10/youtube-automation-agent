@@ -35,14 +35,17 @@ class AIVideoGenerator {
     }
 
     // Gemini media generation (images + native TTS) — free-tier alternative to OpenAI
-    const geminiKey = resolvedCredentials.gemini?.apiKey || process.env.GEMINI_API_KEY;
-    if (geminiKey) {
-      try {
-        const { GoogleGenAI } = require('@google/genai');
-        this.gemini = new GoogleGenAI({ apiKey: geminiKey });
-        this.logger.info('Gemini media service initialized (images + TTS)');
-      } catch (error) {
-        this.logger.warn('Failed to initialize Gemini media service:', error.message);
+    const rawGeminiKey = resolvedCredentials.gemini?.apiKey || process.env.GEMINI_API_KEY;
+    if (rawGeminiKey && typeof rawGeminiKey === 'string') {
+      const cleanGeminiKey = rawGeminiKey.split(/[\r\n,;]+/)[0]?.replace(/['"`]/g, '').trim();
+      if (cleanGeminiKey && cleanGeminiKey.length >= 10 && !/\s/.test(cleanGeminiKey) && !/[^\x21-\x7E]/.test(cleanGeminiKey)) {
+        try {
+          const { GoogleGenAI } = require('@google/genai');
+          this.gemini = new GoogleGenAI({ apiKey: cleanGeminiKey });
+          this.logger.info('Gemini media service initialized (images + TTS)');
+        } catch (error) {
+          this.logger.warn('Failed to initialize Gemini media service:', error.message);
+        }
       }
     }
     

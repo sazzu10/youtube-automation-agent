@@ -64,7 +64,8 @@ class SystemTest {
       { name: 'Reply Approval and Posting', test: () => this.testReplyApprovalAndPosting() },
       { name: 'Engagement AI Provider Wiring', test: () => this.testEngagementAIProviderWiring() },
       { name: 'Engagement Sync Schedule', test: () => this.testEngagementSyncSchedule() },
-      { name: 'Growth Experiment Refresh Schedule', test: () => this.testGrowthExperimentRefreshSchedule() }
+      { name: 'Growth Experiment Refresh Schedule', test: () => this.testGrowthExperimentRefreshSchedule() },
+      { name: 'ContentStrategy Header and Filter Regression', test: () => this.testContentStrategyHeaderAndFilterRegression() }
     ];
 
     let passed = 0;
@@ -3632,6 +3633,71 @@ class SystemTest {
     }
     const noService = new DailyAutomation({}, {}, {});
     await noService.refreshGrowthExperiments();
+  }
+
+  async testContentStrategyHeaderAndFilterRegression() {
+    const { GeminiKeyRotator } = require('./utils/gemini-key-rotator');
+    const { ContentStrategyAgent } = require('./agents/content-strategy-agent');
+
+    // 1. Verify key sanitization and multi-line extraction
+    const rotator = new GeminiKeyRotator();
+    const rawMultiline = `
+      "AIzaSySampleKeyOneValidLength123"
+      AIzaSySampleKeyTwoValidLength456
+      invalid_short
+      AIzaSySampleKeyThreeValidLength789\r\n
+    `;
+    const extracted = rotator.sanitizeAndExtractKeys(rawMultiline, 'test_multiline');
+    if (extracted.length !== 3) {
+      throw new Error(`Expected 3 sanitized keys from multiline input, got ${extracted.length}`);
+    }
+    for (const item of extracted) {
+      if (/[\r\n\s]/.test(item.key) || item.key.includes('"') || item.key.includes("'")) {
+        throw new Error(`Sanitized key contained invalid characters: ${JSON.stringify(item.key)}`);
+      }
+    }
+
+    // 2. Verify ContentStrategyAgent handles uninitialized state & template fallback without throwing on filter
+    const mockDb = {
+      getContentHistory: async () => [],
+      saveContentStrategy: async () => ({ id: 'mock-1' })
+    };
+    const mockCreds = {
+      getYouTubeClient: () => { throw new Error('YouTube offline in test'); },
+      hasAITextProvider: () => true,
+      credentials: {}
+    };
+
+    const strategyAgent = new ContentStrategyAgent(mockDb, mockCreds);
+    // Deliberately DO NOT call strategyAgent.initialize() - reproduces the pipeline environment
+    // Mock aiTextService to simulate invalid HTTP header failure
+    strategyAgent.aiTextService = {
+      isAvailable: () => true,
+      generateText: async () => {
+        throw new Error('Headers.append: "***\\n***" is an invalid header value.');
+      }
+    };
+
+    const fallbackResult = await strategyAgent.generateContentStrategy();
+    if (!fallbackResult || !fallbackResult.topic) {
+      throw new Error('Expected fallback content strategy to produce a valid topic');
+    }
+
+    // 3. Verify parseAIJsonResponse handles fences, object, and array structures
+    const parsedObj = strategyAgent.parseAIJsonResponse('```json\n{"topic":"AI Tech","contentType":"Explainer"}\n```');
+    if (parsedObj.topic !== 'AI Tech') throw new Error('Failed to parse json fenced object');
+
+    const parsedArr = strategyAgent.parseAIJsonResponse('```json\n[{"topic":"AI Trends","contentType":"Tutorial"}]\n```');
+    if (!Array.isArray(parsedArr) || parsedArr[0].topic !== 'AI Trends') throw new Error('Failed to parse json fenced array');
+
+    // 4. Verify competitor insights & recent topics guard against undefined/malformed data
+    strategyAgent.competitorData = undefined;
+    strategyAgent.historicalPerformance = undefined;
+    const insights = strategyAgent.getCompetitorInsights('test');
+    if (!Array.isArray(insights) || insights.length !== 0) throw new Error('getCompetitorInsights failed with undefined data');
+
+    const recent = strategyAgent.getRecentTopics();
+    if (!Array.isArray(recent) || recent.length !== 0) throw new Error('getRecentTopics failed with undefined historicalPerformance');
   }
 }
 

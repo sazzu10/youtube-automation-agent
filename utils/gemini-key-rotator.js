@@ -24,6 +24,15 @@ class GeminiKeyRotator {
     return `${key.slice(0, 8)}...${key.slice(-4)}`;
   }
 
+  sanitizeAndExtractKeys(raw, sourceName) {
+    if (!raw || typeof raw !== 'string') return [];
+    return raw
+      .split(/[\r\n,;]+/)
+      .map(line => line.replace(/['"`]/g, '').trim())
+      .filter(token => token.length >= 15 && !/\s/.test(token) && !/[^\x21-\x7E]/.test(token))
+      .map(key => ({ source: sourceName, key }));
+  }
+
   reloadKeys() {
     const candidateKeys = [];
 
@@ -32,23 +41,17 @@ class GeminiKeyRotator {
       if (fs.existsSync(this.credentialsPath)) {
         const raw = fs.readFileSync(this.credentialsPath, 'utf8');
         const creds = JSON.parse(raw);
-        if (creds.gemini?.apiKey && typeof creds.gemini.apiKey === 'string') {
-          const k = creds.gemini.apiKey.trim();
-          if (k.length > 10) {
-            candidateKeys.push({ source: 'config/credentials.json', key: k });
-          }
+        if (creds.gemini?.apiKey) {
+          candidateKeys.push(...this.sanitizeAndExtractKeys(creds.gemini.apiKey, 'config/credentials.json'));
         }
       }
     } catch (err) {
       this.logger.warn(`Failed reading credentials.json for Gemini keys: ${err.message}`);
     }
 
-    // 2. Environment variable GEMINI_API_KEY
-    if (process.env.GEMINI_API_KEY && typeof process.env.GEMINI_API_KEY === 'string') {
-      const k = process.env.GEMINI_API_KEY.trim();
-      if (k.length > 10) {
-        candidateKeys.push({ source: 'process.env.GEMINI_API_KEY', key: k });
-      }
+    // 2. Environment variable GEMINI_API_KEY (handles single key, multiline, or comma-separated keys)
+    if (process.env.GEMINI_API_KEY) {
+      candidateKeys.push(...this.sanitizeAndExtractKeys(process.env.GEMINI_API_KEY, 'process.env.GEMINI_API_KEY'));
     }
 
     // 3. Additional spare keys: .gemini-key2 through .gemini-key10
@@ -56,10 +59,8 @@ class GeminiKeyRotator {
       const keyFile = path.join(this.repoRoot, `.gemini-key${i}`);
       try {
         if (fs.existsSync(keyFile)) {
-          const content = fs.readFileSync(keyFile, 'utf8').trim();
-          if (content && content.length >= 20) {
-            candidateKeys.push({ source: `.gemini-key${i}`, key: content });
-          }
+          const content = fs.readFileSync(keyFile, 'utf8');
+          candidateKeys.push(...this.sanitizeAndExtractKeys(content, `.gemini-key${i}`));
         }
       } catch (_) {}
     }
@@ -90,6 +91,12 @@ class GeminiKeyRotator {
     });
 
     this.logger.info(`Loaded ${this.keys.length} Gemini API key(s) for rotation`);
+  }
+
+  isKeyAuthError(error) {
+    if (!error) return false;
+    const msg = String(error.message || error.statusText || error || '');
+    return /API_KEY_INVALID|PERMISSION_DENIED|invalid header value|unauthorized|invalid api key/i.test(msg);
   }
 
   isRateLimitError(error) {
@@ -193,6 +200,11 @@ class GeminiKeyRotator {
         if (this.isRateLimitError(err)) {
           this.markKeyExhausted(keyObj);
           this.logger.info(`Rotating to next Gemini key... (attempt ${attempt + 1}/${totalKeys})`);
+          continue;
+        }
+        if (this.isKeyAuthError(err)) {
+          this.markKeyExhausted(keyObj, 3600000); // 1hr cooldown for bad/invalid keys
+          this.logger.warn(`Gemini key rejected (${err.message?.slice(0, 80)}). Rotating to next key... (attempt ${attempt + 1}/${totalKeys})`);
           continue;
         }
         if (this.isTransientError(err)) {

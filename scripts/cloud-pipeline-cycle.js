@@ -65,6 +65,12 @@ async function runCloudPipelineCycle() {
     publishing: hasYouTube ? new PublishingSchedulingAgent(db, credentials) : null
   };
 
+  if (agents.strategy) {
+    await agents.strategy.initialize().catch(err => {
+      logger.warn(`Strategy agent initialization warning: ${err.message}`);
+    });
+  }
+
   if (agents.publishing) {
     await agents.publishing.initialize().catch(err => {
       logger.warn(`Publishing agent initialization warning: ${err.message}`);

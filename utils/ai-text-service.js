@@ -103,13 +103,17 @@ class AITextService {
     const model = credentials.aiProvider?.model;
 
     if (provider && PROVIDERS[provider] && apiKey) {
-      this._initOpenAICompatible(PROVIDERS[provider], apiKey, model);
+      const cleanKey = String(apiKey).replace(/['"`]/g, '').trim();
+      this._initOpenAICompatible(PROVIDERS[provider], cleanKey, model);
     } else {
       for (const [, preset] of Object.entries(PROVIDERS)) {
         const key = process.env[preset.envKey];
         if (key) {
-          this._initOpenAICompatible(preset, key);
-          break;
+          const cleanKey = String(key).replace(/['"`]/g, '').trim();
+          if (cleanKey.length >= 10 && !/\s/.test(cleanKey)) {
+            this._initOpenAICompatible(preset, cleanKey);
+            break;
+          }
         }
       }
     }
@@ -242,15 +246,15 @@ class AITextService {
           return text.trim();
         };
 
-        if (this.gemini) {
-          return await invokeGemini(this.gemini);
-        }
-        if (this.keyRotator) {
+        if (this.keyRotator && this.keyRotator.getKeyCount() > 0) {
           return await this.keyRotator.executeWithRotation(async (apiKey) => {
             const { GoogleGenAI } = require('@google/genai');
             const client = new GoogleGenAI({ apiKey });
             return await invokeGemini(client);
           });
+        }
+        if (this.gemini) {
+          return await invokeGemini(this.gemini);
         }
       } catch (error) {
         if (this.cloudflareAI) {
